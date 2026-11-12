@@ -19,7 +19,9 @@ concurrency:
 
 jobs:
   bundle:
-    runs-on: macos-14
+    # macos-latest tracks GitHub's current Apple Silicon image, so the workflow doesn't break when
+    # a pinned image (like macos-14) is retired. The bundle is universal either way.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
