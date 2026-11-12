@@ -1,0 +1,68 @@
+# Tests, then builds a universal (arm64 + x86_64) Wgitpui.app with the CLI inside, packaged as
+# .dmg and .zip. Every run uploads them as workflow artifacts; pushing a `v*` tag also
+# publishes them on a GitHub release.
+name: macOS app
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # creating releases on tags
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bundle:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: macos-cargo-
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Icon renderer
+        run: brew install librsvg
+
+      - name: Bundle
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then export VERSION="${GITHUB_REF_NAME#v}"; fi
+          scripts/bundle-macos.sh --universal
+          lipo -info dist/Wgitpui.app/Contents/MacOS/wgitpui
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Wgitpui-macos
+          path: |
+            dist/*.dmg
+            dist/*.zip
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "Wgitpui $GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/*.dmg dist/*.zip --clobber
