@@ -48,6 +48,11 @@ impl Rect {
         self.w -= w;
         r
     }
+    pub fn take_bottom(&mut self, h: f32) -> Rect {
+        let h = h.clamp(0.0, self.h);
+        self.h -= h;
+        Rect::new(self.x, self.y + self.h, self.w, h)
+    }
     pub fn take_right(&mut self, w: f32) -> Rect {
         let w = w.clamp(0.0, self.w);
         self.w -= w;
@@ -610,6 +615,19 @@ impl Ui {
     }
 
     /// A small rounded label.
+    /// A number in a rounded badge (e.g. changed files), right-aligned at `right`, centered on
+    /// `cy`. Single digits get a circle. Returns the badge width.
+    pub fn count_badge(&mut self, right: f32, cy: f32, n: usize, color: Color) -> f32 {
+        let size = 10.5;
+        let s = n.to_string();
+        let tw = self.p.measure(crate::font::UI, size, &s);
+        let w = (tw + 10.0).max(16.0);
+        let r = Rect::new(right - w, cy - 8.0, w, 16.0);
+        self.p.rounded(r, 8.0, color.alpha(0.18));
+        self.p.text(r.x + (w - tw) * 0.5, cy, crate::font::UI, size, &s, color);
+        w
+    }
+
     pub fn pill(&mut self, x: f32, cy: f32, label: &str, fg: Color, bg: Color, outline: bool) -> f32 {
         let size = 11.0;
         let w = self.p.measure(crate::font::UI, size, label) + 12.0;

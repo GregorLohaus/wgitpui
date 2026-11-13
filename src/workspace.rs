@@ -217,8 +217,28 @@ impl Workspace {
             app.frame_in(ui, body);
             ui.blocked = blocked;
             let requests = std::mem::take(&mut self.tabs[self.active].open_requests);
+            let mut closing = Vec::new();
+            let mut quiet = Vec::new();
+            for (i, t) in self.tabs.iter_mut().enumerate() {
+                closing.append(&mut t.close_requests);
+                if i != self.active {
+                    quiet.append(&mut t.open_requests);
+                }
+            }
             for p in requests {
                 self.open_tab(&p);
+            }
+            // Work that finished in a background tab (a worktree it was adding) opens without
+            // taking focus.
+            for p in quiet {
+                self.add_tab(&p, true, true);
+                self.save();
+            }
+            // Worktrees that were removed: their tabs go too.
+            for p in closing {
+                if let Some(i) = self.tabs.iter().position(|t| t.root().is_some_and(|r| crate::git::same_path(&r, &p) || r == p)) {
+                    self.close(i);
+                }
             }
         }
         ui.blocked = false;
@@ -333,7 +353,7 @@ impl Workspace {
                 self.drag = Some(TabDrag { index: i, start_x: ui.input.mouse.0, active: false });
             }
         }
-        // "+" opens the new-tab menu.
+        // "+" goes straight to the folder picker (⌘T still shows recent repositories).
         let plus = Rect::new(x0 + n as f32 * tw, r.cy() - 12.0, 24.0, 24.0);
         self.plus_at = (plus.x, r.bottom() + 4.0);
         hot.push(plus);
@@ -347,8 +367,7 @@ impl Workspace {
         ui.p.line((px - 4.5, py), (px + 4.5, py), 1.5, pc);
         ui.p.line((px, py - 4.5), (px, py + 4.5), 1.5, pc);
         if phov && ui.input.pressed {
-            self.add_menu = Some(self.plus_at);
-            self.add_menu_fresh = true;
+            self.pick_folder();
         }
         ui.p.pop_clip();
 
@@ -517,7 +536,7 @@ impl Workspace {
     }
 }
 
-fn tilde(p: &Path) -> String {
+pub fn tilde(p: &Path) -> String {
     let s = p.display().to_string();
     match std::env::var("HOME") {
         Ok(h) if !h.is_empty() && s.starts_with(&h) => format!("~{}", &s[h.len()..]),
@@ -666,6 +685,24 @@ mod tests {
         frame(&mut ws, &mut ui); // welcome screen renders without tabs
         let _ = std::fs::remove_dir_all(&a);
         let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn background_tabs_open_new_tabs_without_taking_focus() {
+        let (a, b, c) = (repo("qa"), repo("qb"), repo("qc"));
+        let mut ws = Workspace::for_paths(&[a.clone(), b.clone()]);
+        let mut ui = Ui::new(crate::font::Fonts::load().unwrap());
+        frame(&mut ws, &mut ui);
+        assert_eq!(ws.tabs[ws.active].root(), Some(b.clone()));
+        // Tab a, in the background, finished adding a worktree: it asks for a tab.
+        ws.tabs[0].open_requests.push(c.clone());
+        frame(&mut ws, &mut ui);
+        assert_eq!(ws.tabs.len(), 3);
+        assert_eq!(ws.tabs[ws.active].root(), Some(b.clone()), "focus stays where it was");
+        assert!(ws.tabs.iter().any(|t| t.root() == Some(c.clone())));
+        for d in [&a, &b, &c] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     #[test]

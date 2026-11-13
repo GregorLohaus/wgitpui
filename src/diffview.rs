@@ -516,7 +516,7 @@ impl DiffView {
         let first = (off / DIFF_ROW_H) as usize;
         let last = (first + (r.h / DIFF_ROW_H) as usize + 2).min(n_rows);
         self.first_row = first;
-        let selectable = matches!(self.mode, DiffMode::Unstaged | DiffMode::Staged);
+        let selectable = matches!(self.mode, DiffMode::Unstaged | DiffMode::Staged | DiffMode::Untracked);
         let mut action = None;
         let mut toggle = None;
 
@@ -596,7 +596,11 @@ impl DiffView {
                         ],
                         DiffMode::Staged if n == 0 => vec![("Unstage hunk".into(), false, false)],
                         DiffMode::Staged => vec![(format!("Unstage {n} line{}", plural(n)), false, true)],
-                        DiffMode::Untracked => vec![("Delete file".into(), true, false), ("Stage file".into(), false, false)],
+                        DiffMode::Untracked if n == 0 => vec![("Delete file".into(), true, false), ("Stage file".into(), false, false)],
+                        DiffMode::Untracked => vec![
+                            (format!("Discard {n} line{}", plural(n)), true, false),
+                            (format!("Stage {n} line{}", plural(n)), false, true),
+                        ],
                         DiffMode::Commit => vec![],
                     };
                     let widths: Vec<f32> = buttons.iter().map(|b| ui.p.measure(UI, 12.5, &b.0) + 22.0).collect();
@@ -608,8 +612,8 @@ impl DiffView {
                         let hit = if discard { ui.danger_button(b, &label) } else { ui.button(b, &label, primary, true) };
                         if hit {
                             action = Some(match (self.mode, discard) {
-                                (DiffMode::Untracked, true) => DiffAction::DeleteUntracked(path.clone()),
-                                (DiffMode::Untracked, false) => DiffAction::StageFile(path.clone()),
+                                (DiffMode::Untracked, true) if n == 0 => DiffAction::DeleteUntracked(path.clone()),
+                                (DiffMode::Untracked, false) if n == 0 => DiffAction::StageFile(path.clone()),
                                 (_, true) => DiffAction::Discard { f: fi, h: hi, lines_only: n > 0 },
                                 (_, false) => DiffAction::Hunk { f: fi, h: hi, lines_only: n > 0 },
                             });
@@ -772,4 +776,39 @@ fn change_runs(lines: &[String]) -> Vec<(Vec<usize>, Vec<usize>)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::Hunk;
+
+    #[test]
+    fn untracked_lines_select_and_offer_line_staging() {
+        let fd = FileDiff {
+            header: vec!["diff --git a/u b/u".into(), "new file mode 100644".into(), "--- /dev/null".into(), "+++ b/u".into()],
+            path: "u".into(),
+            hunks: vec![Hunk { header: "@@ -0,0 +1,2 @@".into(), old_start: 0, new_start: 1, lines: vec!["+p".into(), "+q".into()] }],
+            adds: 2,
+            ..Default::default()
+        };
+        let mut v = DiffView::new(vec![fd], DiffMode::Untracked, "u".into());
+        let mut ui = Ui::new(crate::font::Fonts::load().unwrap());
+        let r = Rect::new(0.0, 0.0, 900.0, 400.0);
+        // Rows: file, hunk, "+p", "+q". Click "+q".
+        ui.begin(900.0, 400.0, 1.0);
+        ui.input.mouse = (400.0, 3.5 * DIFF_ROW_H);
+        ui.input.pressed = true;
+        ui.input.down = true;
+        assert!(v.draw(&mut ui, r, false, false).is_none());
+        ui.input.end_frame();
+        assert!(v.selected.contains(&(0, 0, 1)));
+        // The hunk's primary button now stages just that line.
+        ui.input.down = false;
+        ui.begin(900.0, 400.0, 1.0);
+        ui.input.mouse = (900.0 - 30.0, 1.5 * DIFF_ROW_H);
+        ui.input.pressed = true;
+        let a = v.draw(&mut ui, r, false, false);
+        assert!(matches!(a, Some(DiffAction::Hunk { f: 0, h: 0, lines_only: true })));
+    }
 }

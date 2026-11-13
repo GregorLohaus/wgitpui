@@ -281,13 +281,14 @@ struct Args {
     wide: bool,
     menu: Option<String>,
     resolve: Option<(String, String)>,
-    push_menu: bool,
+    /// "push" | "pull" | "fetch": open that button's remote picker.
+    remote_menu: Option<&'static str>,
     /// Stay attached to the terminal instead of moving to the background.
     foreground: bool,
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { repos: vec![], screenshot: None, size: (1440, 900), scale: 2.0, commit: None, palette: None, files: false, open: None, compare: None, split: None, wide: false, menu: None, resolve: None, push_menu: false, foreground: false };
+    let mut a = Args { repos: vec![], screenshot: None, size: (1440, 900), scale: 2.0, commit: None, palette: None, files: false, open: None, compare: None, split: None, wide: false, menu: None, resolve: None, remote_menu: None, foreground: false };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -313,7 +314,9 @@ fn parse_args() -> Args {
             "--unified" => a.split = Some(false),
             "--wide" => a.wide = true,
             "--menu" => a.menu = it.next(),
-            "--push-menu" => a.push_menu = true,
+            "--push-menu" => a.remote_menu = Some("push"),
+            "--pull-menu" => a.remote_menu = Some("pull"),
+            "--fetch-menu" => a.remote_menu = Some("fetch"),
             "--resolve" => {
                 a.resolve = it.next().map(|s| match s.split_once(':') {
                     Some((p, c)) => (p.to_string(), c.to_string()),
@@ -328,7 +331,7 @@ fn parse_args() -> Args {
                 println!("From a terminal, opens REPO (default: the current directory) in the running app,");
                 println!("or starts the app in the background so the shell stays usable. -f keeps it attached.");
                 println!();
-                println!("debug: wgitpui [--screenshot out.png [--size WxH] [--scale S] [--commit N] [--palette QUERY] [--files] [--open PATH] [--compare A,B] [--split|--unified] [--wide] [--menu BRANCH] [--resolve PATH[:o,t,b,-]] [--push-menu]] [REPO]");
+                println!("debug: wgitpui [--screenshot out.png [--size WxH] [--scale S] [--commit N] [--palette QUERY] [--files] [--open PATH] [--compare A,B] [--split|--unified] [--wide] [--menu BRANCH] [--resolve PATH[:o,t,b,-]] [--push-menu|--pull-menu|--fetch-menu]] [REPO]");
                 std::process::exit(0);
             }
             _ => a.repos.push(PathBuf::from(arg)),
@@ -395,8 +398,8 @@ fn main() {
             if let Some((p, c)) = &args.resolve {
                 app.debug_resolve(p, c);
             }
-            if args.push_menu {
-                app.debug_push_menu((f32::MAX, workspace::TAB_H + app::TOP_H + 6.0));
+            if let Some(kind) = args.remote_menu {
+                app.debug_remote_menu(kind, (f32::MAX, workspace::TAB_H + app::TOP_H + 6.0));
             }
             if let Some(m) = &args.menu {
                 app.debug_branch_menu(m, (520.0, 180.0));

@@ -67,6 +67,34 @@ pub enum Act {
     ShowRef(String),
     ShowAllHidden,
     DeleteConflicted(String),
+    /// Show the remote picker under the Fetch / Pull button.
+    FetchMenu,
+    PullMenu,
+    /// `git fetch --prune <remote>`.
+    FetchFrom(String),
+    /// Pull `branch` from `remote` into the current branch: "ff" | "rebase" | "merge".
+    PullFrom { remote: String, branch: String, mode: &'static str },
+    /// Ask for a branch name or path, then create a worktree from this starting point.
+    NewWorktree(WtFrom),
+    /// `git worktree add [-b new_branch | --detach] path rev`, then open it in a tab.
+    AddWorktree { path: String, rev: String, new_branch: Option<String>, detach: bool },
+    /// Open (or switch to) the tab of the worktree at this path.
+    OpenWorktree(String),
+    RemoveWorktree(String),
+    PruneWorktrees,
+}
+
+/// Where a new worktree starts.
+#[derive(Clone, Debug)]
+pub struct WtFrom {
+    /// Commit-ish to check out (branch name, remote branch or hash).
+    pub rev: String,
+    /// Shown in the prompt ("main", "origin/topic", "a1b2c3d4").
+    pub label: String,
+    /// A local branch that isn't checked out anywhere, so the worktree can check it out directly.
+    pub branch: Option<String>,
+    /// Text the prompt starts with (e.g. the local name for a remote branch).
+    pub prefill: String,
 }
 
 pub struct Item {
@@ -86,6 +114,8 @@ pub struct Palette {
     pub scroll: Scroll,
     /// When set, the palette is asking for a new branch name to create at this commit.
     pub branch_at: Option<String>,
+    /// When set, the palette is asking for a new worktree's branch name or path.
+    pub worktree_from: Option<WtFrom>,
     /// True on the frame the palette opened: the click that opened it must not close it.
     pub fresh: bool,
 }
@@ -96,6 +126,7 @@ impl Palette {
         self.query = None;
         self.sel = 0;
         self.branch_at = None;
+        self.worktree_from = None;
         self.fresh = true;
     }
 }

@@ -4,14 +4,15 @@ use crate::chrome;
 use crate::diffview::{BlameSrc, DiffAction, DiffMode, DiffView};
 use crate::fileview::{FileAction, FileView, TreeAction, TreeView};
 use crate::font::{MONO, UI};
-use crate::git::{self, Change, Commit, DiffOpts, LogMsg, MergePreview, OpKind, Ref, RefKind, Repo, Side};
+use crate::git::{self, Change, Commit, DiffOpts, LogMsg, MergePreview, OpKind, Ref, RefKind, Repo, Side, Worktree};
 use crate::graph::Graph;
-use crate::palette::{fuzzy, Act, Item, Palette};
+use crate::palette::{fuzzy, Act, Item, Palette, WtFrom};
 use crate::rebase::{self, ChainItem, RebaseOp};
 use crate::resolve::{ConflictDoc, ResolveAction};
 use crate::ui::{theme, Color, Cursor, Key, Rect, Scroll, TextEdit, Ui};
+use crate::workspace::tilde;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,8 @@ enum Focus {
 enum Drag {
     None,
     Split,
+    /// The divider between the staging column and the diff (wide working copy).
+    StageSplit,
     Minimap,
     Scrubber,
 }
@@ -115,6 +118,7 @@ struct BDrag {
 }
 
 /// Every destructive action records how to reverse itself.
+#[derive(Clone)]
 enum Undo {
     /// A patch that was reverse-applied to the working tree.
     Patch { patch: String, label: String },
@@ -154,6 +158,25 @@ struct Job {
     rx: mpsc::Receiver<Result<String, String>>,
 }
 
+/// A worktree being added (checked out) or removed (its folder deleted, build output and all)
+/// on a background thread; both can take a while. Its sidebar row shows a spinner meanwhile.
+struct WtJob {
+    wt: Worktree,
+    adding: bool,
+    rx: mpsc::Receiver<Result<String, String>>,
+    /// A fresh add / remove: its undo step, recorded once git is done (and a new worktree opens
+    /// in a tab). An undo that adds or removes a worktree: that step itself, which goes back on
+    /// the undo stack if it fails.
+    undo: Undo,
+    is_undo: bool,
+}
+
+impl WtJob {
+    fn status(&self) -> &'static str {
+        if self.adding { "adding…" } else { "removing…" }
+    }
+}
+
 /// An in-progress drag of a commit row in the graph (interactive rebase).
 struct GDrag {
     src: usize,
@@ -181,6 +204,8 @@ pub struct GitApp {
     chain: Option<Vec<usize>>,
     // Working copy.
     changes: Vec<Change>,
+    /// Every working tree of the repository, this one included (change counts filled in).
+    worktrees: Vec<Worktree>,
     op: Option<OpKind>,
     /// Conflict resolver: parsed documents (keeps per-file progress) and the open one.
     docs: HashMap<String, ConflictDoc>,
@@ -219,16 +244,23 @@ pub struct GitApp {
     staged_scroll: Scroll,
     files_scroll: Scroll,
     right_w: Option<f32>,
+    /// Width of the staging column in the wide working-copy layout (None = automatic).
+    stage_w: Option<f32>,
     drag: Drag,
     gdrag: Option<GDrag>,
     // Feedback.
     toast: Option<Toast>,
     job: Option<Job>,
+    wt_jobs: Vec<WtJob>,
     undo: Vec<Undo>,
     /// Hosted in a tab: the tab strip shows the repo name, and "open repository" requests go
     /// to the workspace instead of replacing this repo.
     pub in_tab: bool,
     pub open_requests: Vec<PathBuf>,
+    /// Tabs to close because their worktree was removed.
+    pub close_requests: Vec<PathBuf>,
+    /// Where the Push / Pull / Fetch buttons drop their menus (updated as the top bar draws).
+    remote_btns: [(f32, f32); 3],
     /// Recently opened repositories (for the palette), provided by the workspace.
     pub recent: Vec<PathBuf>,
 }
@@ -251,6 +283,7 @@ impl GitApp {
             restore_sel: None,
             chain: None,
             changes: vec![],
+            worktrees: vec![],
             op: None,
             docs: HashMap::new(),
             resolving: None,
@@ -284,13 +317,17 @@ impl GitApp {
             staged_scroll: Scroll::default(),
             files_scroll: Scroll::default(),
             right_w: None,
+            stage_w: None,
             drag: Drag::None,
             gdrag: None,
             toast: None,
             job: None,
+            wt_jobs: vec![],
             undo: vec![],
             in_tab: false,
             open_requests: vec![],
+            close_requests: vec![],
+            remote_btns: [(f32::MAX, TOP_H + 6.0); 3],
             recent: vec![],
         };
         let path = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -390,9 +427,13 @@ impl GitApp {
         }
     }
 
-    /// Screenshot hook: open the Push remote picker.
-    pub fn debug_push_menu(&mut self, at: (f32, f32)) {
-        self.open_push_menu(at);
+    /// Screenshot hook: open the Push / Pull / Fetch remote picker.
+    pub fn debug_remote_menu(&mut self, kind: &str, at: (f32, f32)) {
+        match kind {
+            "pull" => self.open_pull_menu(at),
+            "fetch" => self.open_fetch_menu(at),
+            _ => self.open_push_menu(at),
+        }
     }
 
     pub fn on_focus(&mut self) {
@@ -502,16 +543,91 @@ impl GitApp {
     }
 
     fn undo(&mut self) {
+        // A worktree job in flight hasn't recorded its step yet; don't undo an older one instead.
+        if let Some(j) = self.wt_jobs.first() {
+            let verb = if j.adding { "adding" } else { "removing" };
+            self.toast_err(format!("Still {verb} {} — undo when it's done", j.wt.name()));
+            return;
+        }
         let (Some(repo), Some(u)) = (&self.repo, self.undo.pop()) else {
             self.toast_ok("Nothing to undo");
             return;
         };
+        // Undoing "add worktree" deletes a whole tree, undoing "remove worktree" checks one out
+        // again: off the UI thread, like any worktree add / remove.
+        let (removes, adds) = (removed_worktrees(&u), added_worktrees(&u));
+        if let Some(p) = removes.first().or(adds.first()) {
+            let wt = self.worktrees.iter().find(|w| w.path == *p).cloned().unwrap_or_else(|| Worktree { path: p.clone(), ..Default::default() });
+            let adding = removes.is_empty();
+            let (root, step) = (repo.root.clone(), u.clone());
+            self.close_requests.extend(removes);
+            self.start_wt_job(wt, adding, u, true, move || Self::apply_undo(&Repo { root }, &step));
+            return;
+        }
         let r = Self::apply_undo(repo, &u);
         let label = u.label().to_string();
         if self.result(r, &format!("Undid: {label}")) {
             self.reload_all(false);
         } else {
             self.undo.push(u);
+        }
+    }
+
+    /// A worktree at `path` is being added or removed in the background.
+    fn wt_busy(&self, path: &Path) -> bool {
+        self.wt_jobs.iter().any(|j| j.wt.path == path)
+    }
+
+    /// Runs `work` (a worktree add or remove) on its own thread; the sidebar tracks it.
+    fn start_wt_job(&mut self, wt: Worktree, adding: bool, undo: Undo, is_undo: bool, work: impl FnOnce() -> Result<String, String> + Send + 'static) {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        self.wt_jobs.push(WtJob { wt, adding, rx, undo, is_undo });
+    }
+
+    /// Picks up finished worktree jobs: records undo (opening new worktrees in a tab) or
+    /// reports the error, then refreshes.
+    fn poll_wt_jobs(&mut self, ui: &mut Ui) {
+        if self.wt_jobs.is_empty() {
+            return;
+        }
+        let mut done = Vec::new();
+        let mut i = 0;
+        while i < self.wt_jobs.len() {
+            match self.wt_jobs[i].rx.try_recv() {
+                Ok(res) => done.push((self.wt_jobs.remove(i), res)),
+                Err(mpsc::TryRecvError::Disconnected) => done.push((self.wt_jobs.remove(i), Err("worktree job stopped unexpectedly".into()))),
+                Err(mpsc::TryRecvError::Empty) => i += 1,
+            }
+        }
+        if !self.wt_jobs.is_empty() {
+            ui.wake_in(Duration::from_millis(100));
+        }
+        if done.is_empty() {
+            return;
+        }
+        let mut open = Vec::new();
+        for (j, res) in done {
+            match (res, j.is_undo) {
+                (Ok(_), false) => {
+                    if j.adding {
+                        open.push(j.wt.path.display().to_string());
+                    }
+                    self.push_undo(j.undo);
+                }
+                (Ok(_), true) => self.toast_ok(format!("Undid: {}", j.undo.label())),
+                (Err(e), false) => self.toast_err(e),
+                (Err(e), true) => {
+                    self.undo.push(j.undo);
+                    self.toast_err(e);
+                }
+            }
+        }
+        self.reload_all(false);
+        for p in open {
+            self.act(Act::OpenWorktree(p));
         }
     }
 
@@ -546,6 +662,90 @@ impl GitApp {
             self.op = repo.op_in_progress();
         }
         self.reload_status();
+        self.reload_worktrees();
+    }
+
+    /// Lists the repository's working trees and counts the changes in each of the others.
+    fn reload_worktrees(&mut self) {
+        let Some(repo) = &self.repo else { return };
+        let mut wts = repo.worktrees();
+        for w in &mut wts {
+            w.changes = if git::same_path(&w.path, &repo.root) {
+                self.changes.len()
+            } else if w.bare || w.prunable || self.wt_jobs.iter().any(|j| j.wt.path == w.path) {
+                0
+            } else {
+                git::change_count(&w.path)
+            };
+        }
+        self.worktrees = wts;
+    }
+
+    fn is_current_wt(&self, w: &Worktree) -> bool {
+        self.repo.as_ref().is_some_and(|r| git::same_path(&w.path, &r.root))
+    }
+
+    /// The other working trees (not this one, not a bare main entry), in `git worktree list` order.
+    fn other_worktrees(&self) -> Vec<Worktree> {
+        self.worktrees.iter().filter(|w| !w.bare && !self.is_current_wt(w)).cloned().collect()
+    }
+
+    /// Another worktree that has `branch` checked out (git won't check it out a second time).
+    fn branch_worktree(&self, branch: &str) -> Option<&Worktree> {
+        self.worktrees.iter().find(|w| w.branch.as_deref() == Some(branch) && !self.is_current_wt(w) && !self.wt_busy(&w.path))
+    }
+
+    /// The other worktrees for the sidebar, each with "adding…" / "removing…" while a background
+    /// job works on it. Those stay listed until git is done, whatever a refresh in between sees.
+    fn sidebar_worktrees(&self) -> Vec<(Worktree, Option<&'static str>)> {
+        let busy = |p: &Path| self.wt_jobs.iter().find(|j| j.wt.path == p).map(WtJob::status);
+        let mut v: Vec<(Worktree, Option<&'static str>)> = self.other_worktrees().into_iter().map(|w| {
+            let b = busy(&w.path);
+            (w, b)
+        }).collect();
+        for j in &self.wt_jobs {
+            if !v.iter().any(|(w, _)| w.path == j.wt.path) && !self.is_current_wt(&j.wt) {
+                v.push((j.wt.clone(), Some(j.status())));
+            }
+        }
+        v
+    }
+
+    /// A local branch no worktree has checked out.
+    fn branch_free(&self, branch: &str) -> bool {
+        self.local_names.contains(branch)
+            && branch != self.head_name
+            && !self.worktrees.iter().any(|w| w.branch.as_deref() == Some(branch))
+    }
+
+    /// Starting point for a new worktree: the selected commit (checking out its branch when one
+    /// is free), or the current HEAD.
+    fn wt_from_selection(&self) -> Option<WtFrom> {
+        if let Some(i) = self.sel_row() {
+            let c = &self.commits[i];
+            let free = c.refs.iter().map(|r| r.strip_prefix("HEAD -> ").unwrap_or(r)).find(|r| self.branch_free(r)).map(String::from);
+            return Some(match free {
+                Some(b) => WtFrom { rev: b.clone(), label: b.clone(), branch: Some(b), prefill: String::new() },
+                None => WtFrom { rev: c.hash.clone(), label: c.short().to_string(), branch: None, prefill: String::new() },
+            });
+        }
+        let head = self.repo.as_ref()?.rev_parse("HEAD")?;
+        Some(WtFrom { rev: head, label: self.head_name.clone(), branch: None, prefill: String::new() })
+    }
+
+    /// Default location for a new worktree: next to the main one, as `<repo>-<name>`.
+    fn default_wt_path(&self, name: &str) -> String {
+        let main = self.worktrees.first().map(|w| w.path.clone()).or_else(|| self.root()).unwrap_or_default();
+        let parent = main.parent().map(Path::to_path_buf).unwrap_or_default();
+        let base = main.file_name().map_or_else(|| "worktree".into(), |n| n.to_string_lossy().into_owned());
+        let slug: String = name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' }).collect();
+        let mut p = parent.join(format!("{base}-{slug}"));
+        let mut n = 2;
+        while p.exists() {
+            p = parent.join(format!("{base}-{slug}-{n}"));
+            n += 1;
+        }
+        p.display().to_string()
     }
 
     fn drain_log(&mut self, wait: Option<Duration>) {
@@ -894,7 +1094,98 @@ impl GitApp {
                 self.reload_all(true);
                 self.toast_ok("Refreshed");
             }
-            Act::Fetch => self.spawn("Fetching", own(&["fetch", "--all", "--prune"])),
+            Act::Fetch => self.spawn("Fetching all remotes", own(&["fetch", "--all", "--prune"])),
+            Act::FetchFrom(remote) => self.spawn(&format!("Fetching {remote}"), own(&["fetch", "--prune", &remote])),
+            Act::FetchMenu => self.open_fetch_menu(self.remote_btns[2]),
+            Act::PullMenu => self.open_pull_menu(self.remote_btns[1]),
+            Act::PullFrom { remote, branch, mode } => {
+                if !self.local_names.contains(&self.head_name) {
+                    self.toast_err("Detached HEAD — check out a branch to pull into");
+                    return;
+                }
+                let how: &[&str] = match mode {
+                    "rebase" => &["--rebase", "--autostash"],
+                    "merge" => &["--no-rebase", "--no-edit"],
+                    _ => &["--ff-only"],
+                };
+                let mut args = own(&["pull"]);
+                args.extend(own(how));
+                args.extend([remote.clone(), branch]);
+                self.spawn(&format!("Pulling from {remote}"), args);
+            }
+            Act::NewWorktree(from) => {
+                self.focus = Focus::Palette;
+                self.palette.reset(&from.prefill);
+                self.palette.worktree_from = Some(from);
+            }
+            Act::AddWorktree { path, rev, new_branch, detach } => {
+                let full = expand_home(&path);
+                let full = if full.is_absolute() { full } else { repo.root.join(full) };
+                // Canonical (macOS /tmp → /private/tmp), so undo and tab matching see the path git
+                // reports. The worktree doesn't exist yet; its parent folder usually does.
+                let full = match (full.parent().and_then(|d| d.canonicalize().ok()), full.file_name()) {
+                    (Some(dir), Some(name)) => dir.join(name),
+                    _ => full,
+                };
+                if self.wt_busy(&full) {
+                    return;
+                }
+                let p = full.display().to_string();
+                // Undo runs these in reverse: remove the worktree, then the branch made for it.
+                let mut steps = Vec::new();
+                if let Some(b) = &new_branch {
+                    steps.push(Undo::Cmd { args: own(&["branch", "-D", b]), label: String::new() });
+                }
+                steps.push(Undo::Cmd { args: own(&["worktree", "remove", &p]), label: String::new() });
+                let name = full.file_name().map_or_else(|| p.clone(), |n| n.to_string_lossy().into_owned());
+                let undo = Undo::Many(steps, format!("add worktree {name}"));
+                let branch = new_branch.clone().or_else(|| (!detach).then(|| rev.clone()));
+                let wt = Worktree { path: full, branch, ..Default::default() };
+                // Checking out a big tree can take a while: git runs on its own thread, the new row
+                // shows a spinner, and the worktree opens in a tab once it's ready.
+                let root = repo.root.clone();
+                self.start_wt_job(wt, true, undo, false, move || Repo { root }.worktree_add(&p, &rev, new_branch.as_deref(), detach));
+            }
+            Act::OpenWorktree(p) => {
+                let path = PathBuf::from(&p);
+                if !path.exists() {
+                    self.toast_err(format!("{} no longer exists — prune it from the worktree list", tilde(&path)));
+                } else if self.in_tab {
+                    self.open_requests.push(path);
+                } else {
+                    self.open(path);
+                }
+            }
+            Act::RemoveWorktree(p) => {
+                let Some(w) = self.worktrees.iter().find(|w| w.path == Path::new(&p)).cloned() else { return };
+                if w.changes > 0 {
+                    let n = w.changes;
+                    self.toast_err(format!("{} has {n} changed file{} — commit or discard them in its tab first", w.name(), if n == 1 { "" } else { "s" }));
+                    return;
+                }
+                if w.locked {
+                    self.toast_err(format!("{} is locked — unlock it first (git worktree unlock)", w.name()));
+                    return;
+                }
+                if self.wt_busy(&w.path) {
+                    return;
+                }
+                let args = match &w.branch {
+                    Some(b) => own(&["worktree", "add", &p, b]),
+                    None => own(&["worktree", "add", "--detach", &p, &w.head]),
+                };
+                let undo = Undo::Cmd { args, label: format!("remove worktree {}", w.name()) };
+                // Deleting the folder can take a while: git runs on its own thread, the row shows
+                // a spinner, and its tab closes now.
+                let root = repo.root.clone();
+                self.close_requests.push(w.path.clone());
+                self.start_wt_job(w, false, undo, false, move || git::run(&root, &["worktree", "remove", &p], None));
+            }
+            Act::PruneWorktrees => {
+                let r = repo.git(&["worktree", "prune"]);
+                self.result(r, "Pruned stale worktrees");
+                self.reload_all(false);
+            }
             Act::Pull => self.spawn("Pulling", own(&["pull", "--ff-only"])),
             Act::Push => {
                 let has_upstream = repo.git(&["rev-parse", "--abbrev-ref", "@{u}"]).is_ok();
@@ -1104,7 +1395,7 @@ impl GitApp {
                     self.job = Some(Job { label: "Installing command".into(), rx });
                 }
             }
-            Act::PushMenu => self.open_push_menu((f32::MAX, TOP_H + 6.0)),
+            Act::PushMenu => self.open_push_menu(self.remote_btns[0]),
             Act::PushTo { remote, force } => {
                 if !self.local_names.contains(&self.head_name) {
                     self.toast_err("Detached HEAD — check out a branch to push");
@@ -1136,6 +1427,12 @@ impl GitApp {
                 self.reload_status();
             }
             Act::Checkout(name) => {
+                // git refuses to check a branch out twice; go to the worktree that has it instead.
+                if let Some(w) = self.branch_worktree(&name) {
+                    let p = w.path.display().to_string();
+                    self.act(Act::OpenWorktree(p));
+                    return;
+                }
                 let r = repo.git(&["switch", &name]);
                 self.result(r, &format!("Switched to {name}"));
                 self.reload_all(false);
@@ -1429,6 +1726,7 @@ impl GitApp {
             ui.wake_in(Duration::from_millis(60));
         }
         self.poll_job(ui);
+        self.poll_wt_jobs(ui);
     }
 
     /// (repo name, branch, number of changed files, operation in progress / conflicts)
@@ -1448,6 +1746,7 @@ impl GitApp {
             ui.wake_in(Duration::from_millis(30));
         }
         self.poll_job(ui);
+        self.poll_wt_jobs(ui);
         self.tick_playback(ui);
         self.global_keys(ui);
 
@@ -1494,15 +1793,10 @@ impl GitApp {
         match job.rx.try_recv() {
             Ok(r) => {
                 let l = job.label.as_str();
-                let done = if let Some(rest) = l.strip_prefix("Pushing") {
-                    format!("Pushed{rest}")
-                } else if l.starts_with("Fetching") {
-                    "Fetched".to_string()
-                } else if l.starts_with("Pulling") {
-                    "Pulled".to_string()
-                } else {
-                    "Done".to_string()
-                };
+                let done = [("Pushing", "Pushed"), ("Fetching", "Fetched"), ("Pulling", "Pulled")]
+                    .iter()
+                    .find_map(|(ing, ed)| l.strip_prefix(ing).map(|rest| format!("{ed}{rest}")))
+                    .unwrap_or_else(|| "Done".to_string());
                 let reports = l.starts_with("Installing");
                 self.job = None;
                 match r {
@@ -1686,24 +1980,21 @@ impl GitApp {
                 let w = ui.p.measure(UI, 12.5, &label);
                 let x = r.right() - 16.0 - w;
                 ui.p.text(x, cy, UI, 12.5, &label, theme::DIM);
-                let phase = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 1000) as f32 / 1000.0;
-                for k in 0..8 {
-                    let a = (k as f32 / 8.0 + phase) * std::f32::consts::TAU;
-                    let alpha = 0.15 + 0.85 * (k as f32 / 8.0);
-                    ui.p.circle((x - 16.0 + a.cos() * 6.0, cy + a.sin() * 6.0), 1.4, theme::ACCENT.alpha(alpha));
-                }
-                ui.animating = true;
+                spinner(ui, (x - 16.0, cy), theme::ACCENT);
             } else {
                 let bw = 64.0;
                 let mut bx = r.right() - 12.0 - bw;
-                for (label, act) in [("Push", Act::PushMenu), ("Pull", Act::Pull), ("Fetch", Act::Fetch)] {
+                // Each opens a remote picker anchored under itself.
+                for (i, label) in ["Push", "Pull", "Fetch"].into_iter().enumerate() {
                     let b = Rect::new(bx, cy - 14.0, bw, 28.0);
                     hot.push(b);
+                    let at = (b.x, b.bottom() + 6.0);
+                    self.remote_btns[i] = at;
                     if ui.button(b, label, false, true) {
-                        if matches!(act, Act::PushMenu) {
-                            self.open_push_menu((b.x, b.bottom() + 6.0));
-                        } else {
-                            self.act(act);
+                        match i {
+                            0 => self.open_push_menu(at),
+                            1 => self.open_pull_menu(at),
+                            _ => self.open_fetch_menu(at),
                         }
                     }
                     bx -= bw + 8.0;
@@ -1772,8 +2063,12 @@ impl GitApp {
         let (locals, remotes, tags) = (of(RefKind::Local), of(RefKind::Remote), of(RefKind::Tag));
         let hidden_list: Vec<usize> = (0..self.refs.len()).filter(|&i| hidden(i)).collect();
         let sections = [("BRANCHES", &locals), ("REMOTES", &remotes), ("HIDDEN", &hidden_list), ("TAGS", &tags)];
+        let others = self.sidebar_worktrees();
+        // Branch → the other worktree that has it checked out.
+        let elsewhere: HashMap<&str, String> =
+            others.iter().filter(|(_, busy)| busy.is_none()).filter_map(|(w, _)| Some((w.branch.as_deref()?, w.name()))).collect();
         let content = 30.0
-            + LIST_ROW_H
+            + LIST_ROW_H * (1 + others.len()) as f32
             + 12.0
             + sections.iter().filter(|s| !s.1.is_empty()).map(|s| 30.0 + s.1.len() as f32 * LIST_ROW_H + 8.0).sum::<f32>();
         let off = self.side_scroll.update(ui, r, content);
@@ -1781,6 +2076,20 @@ impl GitApp {
         let x = r.x + 14.0;
         let mut y = r.y + 8.0 - off;
         Self::section_header(ui, x, y, "WORKSPACE");
+        // "+" adds a worktree (from the selected commit, or HEAD).
+        let new_wt = {
+            let b = Rect::new(r.right() - 34.0, y + 3.0, 22.0, 20.0);
+            let hov = ui.hovered(b);
+            if hov {
+                ui.p.rounded(b, 5.0, theme::HOVER);
+                ui.cursor = Cursor::Pointer;
+            }
+            let (cx, cy) = (b.x + 11.0, b.cy());
+            let c = if hov { theme::TEXT } else { theme::DIM };
+            ui.p.line((cx - 5.0, cy), (cx + 5.0, cy), 1.6, c);
+            ui.p.line((cx, cy - 5.0), (cx, cy + 5.0), 1.6, c);
+            hov && ui.input.pressed
+        };
         y += 26.0;
 
         let row = Rect::new(r.x + 6.0, y, r.w - 12.0, LIST_ROW_H);
@@ -1792,11 +2101,7 @@ impl GitApp {
         ui.p.ring((x + 6.0, row.cy()), 4.0, 1.5, theme::YELLOW);
         ui.p.text(x + 18.0, row.cy(), UI, 12.5, "Working copy", theme::TEXT);
         if !self.changes.is_empty() {
-            let n = self.changes.len().to_string();
-            let w = ui.p.measure(UI, 10.5, &n) + 10.0;
-            let b = Rect::new(row.right() - w - 6.0, row.cy() - 8.0, w, 16.0);
-            ui.p.rounded(b, 8.0, theme::YELLOW.alpha(0.18));
-            ui.p.text(b.x + 5.0, b.cy(), UI, 10.5, &n, theme::YELLOW);
+            ui.count_badge(row.right() - 6.0, row.cy(), self.changes.len(), theme::YELLOW);
         }
         if hov {
             ui.cursor = Cursor::Pointer;
@@ -1805,7 +2110,57 @@ impl GitApp {
                 self.reveal_row(0);
             }
         }
-        y += LIST_ROW_H + 12.0;
+        y += LIST_ROW_H;
+
+        // The repository's other worktrees: click to open one in its own tab.
+        let mut open_wt: Option<PathBuf> = None;
+        let mut wt_menu: Option<PathBuf> = None;
+        for (w, busy) in &others {
+            let row = Rect::new(r.x + 6.0, y, r.w - 12.0, LIST_ROW_H);
+            y += LIST_ROW_H;
+            // Rows being added or removed are inert until git is done.
+            let hov = ui.hovered(row) && busy.is_none();
+            if hov {
+                ui.p.rounded(row, 5.0, theme::HOVER);
+            }
+            let faint = w.prunable || busy.is_some();
+            let fg = if faint { theme::FAINT } else { theme::TEXT.mix(theme::DIM, 0.3) };
+            // Folder icon.
+            let (ix, iy) = (x + 1.0, row.cy());
+            ui.p.rounded_stroke(Rect::new(ix, iy - 3.5, 11.0, 8.0), 1.5, 1.2, if faint { theme::FAINT } else { theme::DIM });
+            ui.p.line((ix + 1.0, iy - 4.5), (ix + 4.5, iy - 4.5), 1.2, if faint { theme::FAINT } else { theme::DIM });
+            let bw = if busy.is_some() {
+                spinner(ui, (row.right() - 14.0, row.cy()), theme::DIM);
+                22.0
+            } else if w.changes > 0 {
+                ui.count_badge(row.right() - 6.0, row.cy(), w.changes, theme::YELLOW) + 6.0
+            } else {
+                0.0
+            };
+            let room = row.w - 30.0 - bw;
+            let nw = ui.p.text_fit(x + 18.0, row.cy(), room, UI, 12.5, &w.name(), fg);
+            let detail = if let Some(b) = busy {
+                b.to_string()
+            } else if w.prunable {
+                "missing".to_string()
+            } else {
+                let b = w.branch.clone().unwrap_or_else(|| format!("@{}", &w.head[..7.min(w.head.len())]));
+                if w.locked { format!("{b} · locked") } else { b }
+            };
+            if room - nw > 30.0 {
+                ui.p.text_fit(x + 18.0 + nw + 7.0, row.cy(), room - nw - 7.0, UI, 11.0, &detail, theme::FAINT);
+            }
+            if hov {
+                ui.cursor = Cursor::Pointer;
+                if ui.input.pressed && !w.prunable {
+                    open_wt = Some(w.path.clone());
+                }
+                if ui.input.right_pressed || (ui.input.pressed && w.prunable) {
+                    wt_menu = Some(w.path.clone());
+                }
+            }
+        }
+        y += 12.0;
 
         let mut clicked: Option<(usize, bool, bool)> = None;
         let mut rmenu: Option<String> = None;
@@ -1893,16 +2248,24 @@ impl GitApp {
                     ui.p.ring((x + 6.0, row.cy()), 3.5, 1.3, dot);
                 }
                 let mut track = String::new();
+                if rf.kind == RefKind::Local {
+                    if let Some(wt) = elsewhere.get(rf.name.as_str()) {
+                        // Checked out in another worktree (double-click opens it there).
+                        track.push_str(wt);
+                        track.push(' ');
+                    }
+                }
                 if rf.ahead > 0 {
                     track.push_str(&format!("↑{}", rf.ahead));
                 }
                 if rf.behind > 0 {
                     track.push_str(&format!(" ↓{}", rf.behind));
                 }
-                let tw = if track.is_empty() { 0.0 } else { ui.p.measure(UI, 10.5, &track) + 8.0 };
+                let track = track.trim().to_string();
+                let tw = if track.is_empty() { 0.0 } else { (ui.p.measure(UI, 10.5, &track) + 8.0).min(row.w * 0.45) };
                 ui.p.text_fit(x + 18.0, row.cy(), row.w - 30.0 - tw, UI, 12.5, &rf.name, fg);
                 if !track.is_empty() {
-                    ui.p.text(row.right() - tw, row.cy(), UI, 10.5, &track, theme::DIM);
+                    ui.p.text_fit(row.right() - tw, row.cy(), tw - 4.0, UI, 10.5, &track, theme::DIM);
                 }
                 if rf.kind != RefKind::Tag {
                     self.ref_hits.push((row, rf.name.clone()));
@@ -1924,6 +2287,17 @@ impl GitApp {
         }
         ui.p.pop_clip();
 
+        if new_wt {
+            if let Some(from) = self.wt_from_selection() {
+                self.act(Act::NewWorktree(from));
+            }
+        }
+        if let Some(p) = open_wt {
+            self.act(Act::OpenWorktree(p.display().to_string()));
+        }
+        if let Some(p) = wt_menu {
+            self.open_worktree_menu(&p, ui.input.mouse);
+        }
         if let Some(name) = rmenu {
             self.open_branch_menu(&name, ui.input.mouse);
         }
@@ -2437,8 +2811,43 @@ impl GitApp {
         (click, toggle, discard)
     }
 
+    /// Width of the staging column when the working copy is shown wide.
+    fn stage_col_w(&self, panel_w: f32) -> f32 {
+        let auto = (panel_w * 0.3).clamp(340.0, 460.0);
+        self.stage_w.unwrap_or(auto).clamp(300.0, (panel_w - 480.0).max(300.0))
+    }
+
+    /// Drag handle on the divider at `x` between the staging column and the diff.
+    fn stage_splitter(&mut self, ui: &mut Ui, x: f32, panel: Rect) {
+        // Just inside the column's margin, so it never overlaps file rows or the diff.
+        let handle = Rect::new(x - 5.0, panel.y, 6.0, panel.h);
+        if (ui.hovered(handle) && self.drag == Drag::None) || self.drag == Drag::StageSplit {
+            ui.cursor = Cursor::ResizeH;
+            if ui.input.pressed && self.drag == Drag::None {
+                self.drag = Drag::StageSplit;
+            }
+        }
+        if self.drag == Drag::StageSplit {
+            if ui.input.down {
+                self.stage_w = Some((ui.input.mouse.0 - panel.x).clamp(300.0, (panel.w - 480.0).max(300.0)));
+            } else {
+                self.drag = Drag::None;
+            }
+        }
+    }
+
     fn wip_panel(&mut self, ui: &mut Ui, r: Rect) {
-        let mut area = r;
+        // Wide: file lists and the commit message form a column on the left; the diff gets the rest.
+        let columns = self.wide && r.w >= 860.0;
+        let (mut area, diff_area) = if columns {
+            let mut rest = r;
+            let col = rest.take_left(self.stage_col_w(r.w));
+            ui.p.rect(Rect::new(rest.x, rest.y, 1.0, rest.h), theme::BORDER);
+            self.stage_splitter(ui, rest.x, r);
+            (col, Rect::new(rest.x + 1.0, rest.y, rest.w - 1.0, rest.h))
+        } else {
+            (r, Rect::default())
+        };
         let head = area.take_top(44.0);
         ui.p.text(head.x + 16.0, head.cy(), UI, 15.0, "Working copy", theme::TEXT);
         let bw = ui.p.measure(UI, 12.0, &self.head_name);
@@ -2499,6 +2908,25 @@ impl GitApp {
             }
         }
 
+        // Column: the commit message is pinned to the bottom and the two lists share what's left.
+        // A list that needs less than half gets just what it needs; the other one gets the rest.
+        let composer_r = if columns { area.take_bottom((area.h * 0.28).clamp(132.0, 220.0)) } else { Rect::default() };
+        let (unstaged_h, staged_h) = if columns {
+            let avail = (area.h - 60.0).max(2.0 * LIST_ROW_H);
+            let need = |n: usize| n.max(1) as f32 * LIST_ROW_H + 4.0;
+            let (nu, ns) = (need(n_unstaged), need(n_staged));
+            let half = avail * 0.5;
+            if nu + ns <= avail || nu <= half {
+                (nu, avail - nu)
+            } else if ns <= half {
+                (avail - ns, ns)
+            } else {
+                (half, avail - half)
+            }
+        } else {
+            (list_h(n_unstaged), list_h(n_staged))
+        };
+
         // Unstaged
         let hdr = area.take_top(30.0);
         ui.p.text(hdr.x + 16.0, hdr.cy(), UI, 11.0, &format!("UNSTAGED  ·  {n_unstaged}"), theme::FAINT);
@@ -2512,7 +2940,7 @@ impl GitApp {
                 return;
             }
         }
-        let lr = area.take_top(list_h(n_unstaged));
+        let lr = area.take_top(unstaged_h);
         let (c1, t1, d1) = self.file_list(ui, lr, false);
 
         // Staged
@@ -2523,12 +2951,17 @@ impl GitApp {
             self.act(Act::UnstageAll);
             return;
         }
-        let lr = area.take_top(list_h(n_staged));
+        let lr = area.take_top(staged_h);
         let (c2, t2, _) = self.file_list(ui, lr, true);
 
         // Commit composer
-        let mut composer = area.take_top(132.0).pad(12.0, 6.0);
-        let editor = composer.take_top(84.0);
+        let mut composer = if columns {
+            ui.p.rect(Rect::new(composer_r.x + 12.0, composer_r.y, composer_r.w - 24.0, 1.0), theme::BORDER);
+            composer_r.pad(12.0, 8.0)
+        } else {
+            area.take_top(132.0).pad(12.0, 6.0)
+        };
+        let editor = composer.take_top(composer.h - 36.0);
         if self.focus == Focus::Message {
             self.msg.handle(&mut ui.input, true);
         }
@@ -2561,10 +2994,12 @@ impl GitApp {
             self.commit();
         }
 
-        let bar = area.take_top(34.0);
+        // The toolbar lines up with the column's header when they sit side by side.
+        let mut diff_r = if columns { diff_area } else { area };
+        let bar = diff_r.take_top(if columns { 44.0 } else { 34.0 });
         self.diff_toolbar(ui, bar);
-        let split = self.split_for(area.w);
-        if let Some(a) = self.diff.draw(ui, area, split, self.authors) {
+        let split = self.split_for(diff_r.w);
+        if let Some(a) = self.diff.draw(ui, diff_r, split, self.authors) {
             self.apply_diff_action(a);
         }
 
@@ -3144,6 +3579,10 @@ impl GitApp {
             self.palette.items = items;
             return;
         }
+        if let Some(from) = self.palette.worktree_from.clone() {
+            self.palette.items = self.worktree_prompt_items(&from, &q);
+            return;
+        }
         let mut create: Option<Item> = None;
         let mut push = |label: String, detail: String, act: Act, kind: &'static str, extra: &str, boost: i32| {
             let hay = if extra.is_empty() { label.clone() } else { format!("{label} {extra}") };
@@ -3157,6 +3596,9 @@ impl GitApp {
                 ("Fetch all remotes", "git fetch --all --prune".to_string(), Act::Fetch),
                 ("Pull (fast-forward only)", "git pull --ff-only".into(), Act::Pull),
                 ("Push current branch", "git push".into(), Act::Push),
+                ("Push to…", "pick a remote".into(), Act::PushMenu),
+                ("Pull from…", "pick a remote · rebase / merge when diverged".into(), Act::PullMenu),
+                ("Fetch from…", "pick a remote".into(), Act::FetchMenu),
                 ("Stage all changes", "git add -A".into(), Act::StageAll),
                 ("Unstage all changes", "git restore --staged".into(), Act::UnstageAll),
                 ("Discard all unstaged changes", "undoable".into(), Act::DiscardAll),
@@ -3220,11 +3662,34 @@ impl GitApp {
             for (l, d, a) in actions {
                 push(l.into(), d, a, "action", "", 30);
             }
-            if let Some(repo) = &self.repo {
-                for (name, url) in repo.remotes() {
-                    let label = format!("Push {} to {name}", self.head_name);
-                    push(label, short_url(&url), Act::PushTo { remote: name, force: false }, "action", "", 25);
+            if let Some(from) = self.wt_from_selection() {
+                let detail = format!("from {} · git worktree add", from.label);
+                push("New worktree…".into(), detail, Act::NewWorktree(from), "action", "", 28);
+            }
+            let others = self.other_worktrees();
+            for w in &others {
+                let detail = w.branch.clone().unwrap_or_else(|| "detached".into());
+                if !w.prunable && !self.wt_busy(&w.path) {
+                    push(format!("Open worktree {}", w.name()), detail, Act::OpenWorktree(w.path.display().to_string()), "repo", "", 12);
                 }
+            }
+            if others.iter().any(|w| w.prunable) {
+                push("Prune stale worktrees".into(), "git worktree prune".into(), Act::PruneWorktrees, "action", "", 20);
+            }
+            let (remotes, upstream) = self.remotes_upstream_first();
+            let head = self.head_name.clone();
+            for (name, url) in remotes {
+                let rbranch = upstream.as_ref().filter(|(r, _)| *r == name).map_or_else(|| head.clone(), |(_, b)| b.clone());
+                push(format!("Push {head} to {name}"), short_url(&url), Act::PushTo { remote: name.clone(), force: false }, "action", "", 25);
+                push(
+                    format!("Pull {name}/{rbranch} into {head}"),
+                    "fast-forward only".into(),
+                    Act::PullFrom { remote: name.clone(), branch: rbranch, mode: "ff" },
+                    "action",
+                    "",
+                    24,
+                );
+                push(format!("Fetch {name}"), short_url(&url), Act::FetchFrom(name), "action", "", 24);
             }
             for rf in self.refs.iter().filter(|r| !r.is_head && r.kind != RefKind::Tag) {
                 let full = ref_full(rf);
@@ -3321,6 +3786,54 @@ impl GitApp {
         self.palette.items = items;
     }
 
+    /// The new-worktree prompt: type a new branch name (the folder goes next to the main
+    /// worktree), or a path to choose where it goes.
+    fn worktree_prompt_items(&self, from: &WtFrom, q: &str) -> Vec<Item> {
+        let mut items = Vec::new();
+        let is_path = q.starts_with(['/', '~', '.']);
+        let detail = |p: &str| tilde(Path::new(p));
+        if let Some(b) = from.branch.as_ref().filter(|_| q.is_empty() || is_path) {
+            let path = if is_path { q.to_string() } else { self.default_wt_path(b) };
+            items.push(Item {
+                label: format!("Check out {b} in a new worktree"),
+                detail: detail(&path),
+                act: Act::AddWorktree { path, rev: b.clone(), new_branch: None, detach: false },
+                score: 2,
+                kind: "new",
+            });
+        }
+        let valid_name = !q.is_empty() && !is_path && !q.contains(char::is_whitespace) && !q.starts_with('-');
+        if valid_name && self.local_names.contains(q) {
+            items.push(Item {
+                label: format!("A branch named '{q}' already exists"),
+                detail: "pick another name".into(),
+                act: Act::NewWorktree(from.clone()),
+                score: 1,
+                kind: "branch",
+            });
+        } else if valid_name {
+            let path = self.default_wt_path(q);
+            items.push(Item {
+                label: format!("New branch '{q}' from {} in a new worktree", from.label),
+                detail: detail(&path),
+                act: Act::AddWorktree { path, rev: from.rev.clone(), new_branch: Some(q.to_string()), detach: false },
+                score: 1,
+                kind: "new",
+            });
+        }
+        if q.is_empty() || is_path {
+            let path = if is_path { q.to_string() } else { self.default_wt_path(&from.label) };
+            items.push(Item {
+                label: format!("Detached worktree at {}", from.label),
+                detail: detail(&path),
+                act: Act::AddWorktree { path, rev: from.rev.clone(), new_branch: None, detach: true },
+                score: 0,
+                kind: "new",
+            });
+        }
+        items
+    }
+
     fn palette(&mut self, ui: &mut Ui) {
         let input = &mut ui.input;
         if input.take_key(Key::Escape, false).is_some() {
@@ -3367,8 +3880,12 @@ impl GitApp {
         ui.p.rounded(bx, 12.0, theme::PANEL2);
         ui.p.rounded_stroke(bx, 12.0, 1.0, theme::BORDER.mix(theme::TEXT, 0.08));
         let input_r = Rect::new(bx.x + 8.0, bx.y + 8.0, bx.w - 16.0, 36.0);
-        let placeholder = if self.palette.branch_at.is_some() { "New branch name…" } else { "Type a command, branch, commit, or a path to open…" };
-        self.palette.input.draw(ui, input_r, placeholder, true, false);
+        let placeholder = match &self.palette.worktree_from {
+            Some(f) => format!("New worktree from {}: a new branch name, or a path…", f.label),
+            None if self.palette.branch_at.is_some() => "New branch name…".into(),
+            None => "Type a command, branch, commit, or a path to open…".into(),
+        };
+        self.palette.input.draw(ui, input_r, &placeholder, true, false);
 
         let list = Rect::new(bx.x + 6.0, input_r.bottom() + 8.0, bx.w - 12.0, list_h);
         let sel = self.palette.sel;
@@ -3522,14 +4039,159 @@ impl GitApp {
         self.menu = Some(Menu { at, title: format!("Push {branch} to…"), note, items, fresh: true });
     }
 
+    /// Remotes with the current branch's upstream remote first, plus that upstream ("origin/main").
+    fn remotes_upstream_first(&self) -> (Vec<(String, String)>, Option<(String, String)>) {
+        let Some(repo) = &self.repo else { return (vec![], None) };
+        let mut remotes = repo.remotes();
+        // "origin/feature/x" → ("origin", "feature/x"); remote names can't contain '/' here
+        // because we match against the configured list.
+        let upstream = repo.upstream().and_then(|u| {
+            remotes.iter().find_map(|(n, _)| u.strip_prefix(&format!("{n}/")).map(|b| (n.clone(), b.to_string())))
+        });
+        let up = upstream.as_ref().map(|(r, _)| r.clone());
+        remotes.sort_by_key(|(n, _)| Some(n) != up.as_ref());
+        (remotes, upstream)
+    }
+
+    /// Remote picker for Fetch: every remote at once, or one of them.
+    fn open_fetch_menu(&mut self, at: (f32, f32)) {
+        let (remotes, upstream) = self.remotes_upstream_first();
+        if remotes.is_empty() {
+            self.toast_err("No remotes configured — add one with: git remote add origin <url>");
+            return;
+        }
+        let mut items = Vec::new();
+        if remotes.len() > 1 {
+            let mut it = item("All remotes", Act::Fetch);
+            it.detail = format!("{} remotes · prunes deleted branches", remotes.len());
+            items.push(it);
+            items.push(sep());
+        }
+        for (name, url) in &remotes {
+            let up = upstream.as_ref().is_some_and(|(r, _)| r == name);
+            let mut it = item(if up { format!("{name}  (upstream)") } else { name.clone() }, Act::FetchFrom(name.clone()));
+            it.detail = short_url(url);
+            items.push(it);
+        }
+        self.menu = Some(Menu { at, title: "Fetch from…".into(), note: None, items, fresh: true });
+    }
+
+    /// Remote picker for Pull: each remote that has this branch, with how far behind / ahead it
+    /// is (as of the last fetch). Diverged remotes also offer rebase and merge.
+    fn open_pull_menu(&mut self, at: (f32, f32)) {
+        let (remotes, upstream) = self.remotes_upstream_first();
+        if remotes.is_empty() {
+            self.toast_err("No remotes configured — add one with: git remote add origin <url>");
+            return;
+        }
+        let Some(repo) = &self.repo else { return };
+        let branch = self.head_name.clone();
+        let detached = !self.local_names.contains(&branch);
+        let mut items = Vec::new();
+        let mut diverged: Option<(String, String, usize)> = None;
+        let mut any = false;
+        if !detached {
+            for (name, url) in &remotes {
+                // The upstream may track a differently named branch; other remotes use the same name.
+                let up = upstream.as_ref().filter(|(r, _)| r == name);
+                let rbranch = up.map_or_else(|| branch.clone(), |(_, b)| b.clone());
+                let rb = format!("{name}/{rbranch}");
+                if repo.rev_parse(&format!("refs/remotes/{rb}")).is_none() {
+                    continue;
+                }
+                any = true;
+                let ahead = repo.count_range(&rb, "HEAD");
+                let behind = repo.count_range("HEAD", &rb);
+                let state = match (ahead, behind) {
+                    (_, 0) => "up to date".to_string(),
+                    (0, b) => format!("↓{b}"),
+                    (a, b) => {
+                        if diverged.is_none() {
+                            diverged = Some((name.clone(), rbranch.clone(), a));
+                        }
+                        format!("↓{b} ↑{a} · diverged")
+                    }
+                };
+                let label = if up.is_some() { format!("{rb}  (upstream)") } else { rb.clone() };
+                let mut it = item(label, Act::PullFrom { remote: name.clone(), branch: rbranch, mode: "ff" });
+                it.detail = format!("{state}  ·  {}", short_url(url));
+                items.push(it);
+            }
+            if let Some((r, b, a)) = &diverged {
+                items.push(sep());
+                let mut it = item(format!("Rebase onto {r}/{b}"), Act::PullFrom { remote: r.clone(), branch: b.clone(), mode: "rebase" });
+                it.detail = format!("replays your {a} commit{} on top", if *a == 1 { "" } else { "s" });
+                items.push(it);
+                let mut it = item(format!("Merge {r}/{b}"), Act::PullFrom { remote: r.clone(), branch: b.clone(), mode: "merge" });
+                it.detail = "creates a merge commit".into();
+                items.push(it);
+            }
+        }
+        let note = if detached {
+            Some(("Detached HEAD — check out a branch to pull into".to_string(), theme::ORANGE))
+        } else if !any {
+            Some((format!("No remote has {branch} yet — fetch, or push it first"), theme::DIM))
+        } else if let Some((r, b, _)) = &diverged {
+            Some((format!("{branch} and {r}/{b} have diverged — rebase or merge instead of fast-forward"), theme::ORANGE))
+        } else {
+            Some(("Fast-forward only · counts are as of the last fetch".to_string(), theme::DIM))
+        };
+        self.menu = Some(Menu { at, title: format!("Pull into {branch} from…"), note, items, fresh: true });
+    }
+
+    /// Right-click on a worktree in the sidebar.
+    fn open_worktree_menu(&mut self, path: &Path, at: (f32, f32)) {
+        let Some(w) = self.worktrees.iter().find(|w| w.path == path).cloned() else { return };
+        let is_main = self.worktrees.first().is_some_and(|m| m.path == w.path);
+        let p = w.path.display().to_string();
+        let mut items = Vec::new();
+        if !w.prunable {
+            items.push(item("Open in tab", Act::OpenWorktree(p.clone())));
+        }
+        if w.prunable {
+            let mut it = item("Prune stale worktrees", Act::PruneWorktrees);
+            it.detail = "git worktree prune".into();
+            items.push(it);
+        } else if !is_main {
+            items.push(sep());
+            let mut it = danger("Remove worktree", Act::RemoveWorktree(p));
+            it.detail = if w.changes > 0 { "commit or discard its changes first".into() } else { "undoable · keeps the branch".into() };
+            items.push(it);
+        }
+        let what = match &w.branch {
+            Some(b) => format!("on {b}"),
+            None => format!("detached at {}", &w.head[..8.min(w.head.len())]),
+        };
+        let mut note = format!("{what} · {}", match w.changes {
+            0 => "clean".to_string(),
+            1 => "1 changed file".to_string(),
+            n => format!("{n} changed files"),
+        });
+        if w.locked {
+            note.push_str(" · locked");
+        }
+        if w.prunable {
+            note = "The folder is gone — prune to drop it from git's list".into();
+        }
+        let color = if w.prunable || w.changes > 0 { theme::YELLOW } else { theme::DIM };
+        let title = format!("{}{}", tilde(&w.path), if is_main { "  (main worktree)" } else { "" });
+        self.menu = Some(Menu { at, title, note: Some((note, color)), items, fresh: true });
+    }
+
     fn open_commit_menu(&mut self, row: usize, at: (f32, f32)) {
         let c = &self.commits[row];
         let (hash, short) = (c.hash.clone(), c.short().to_string());
         let head = self.head_name.clone();
         let is_head = Some(row) == self.head_row;
+        let free = c.refs.iter().map(|r| r.strip_prefix("HEAD -> ").unwrap_or(r)).find(|r| self.branch_free(r)).map(String::from);
+        let from = match free {
+            Some(b) => WtFrom { rev: b.clone(), label: b.clone(), branch: Some(b), prefill: String::new() },
+            None => WtFrom { rev: hash.clone(), label: short.clone(), branch: None, prefill: String::new() },
+        };
         let mut items = vec![
             item("Create branch here…", Act::PromptBranchAt(hash.clone())),
             item("Check out this commit (detached)", Act::CheckoutDetached(hash.clone())),
+            item("New worktree here…", Act::NewWorktree(from)),
             sep(),
         ];
         let note = if is_head { None } else { self.preview_note("HEAD", &hash, &short) };
@@ -3556,17 +4218,34 @@ impl GitApp {
         let head = self.head_name.clone();
         let mut items = Vec::new();
         let local_twin = rf.name.split_once('/').map(|(_, b)| b.to_string());
+        let wt = |rev: &str, branch: Option<String>, prefill: String| {
+            Act::NewWorktree(WtFrom { rev: rev.to_string(), label: rf.name.clone(), branch, prefill })
+        };
         match rf.kind {
-            RefKind::Local if !rf.is_head => items.push(item(format!("Check out {}", rf.name), Act::Checkout(rf.name.clone()))),
+            RefKind::Local if !rf.is_head => match self.branch_worktree(&rf.name) {
+                Some(w) => {
+                    let mut it = item(format!("Open worktree {}", w.name()), Act::OpenWorktree(w.path.display().to_string()));
+                    it.detail = format!("{} is checked out there", rf.name);
+                    items.push(it);
+                }
+                None => {
+                    items.push(item(format!("Check out {}", rf.name), Act::Checkout(rf.name.clone())));
+                    items.push(item("Check out in new worktree…", wt(&rf.name, Some(rf.name.clone()), String::new())));
+                }
+            },
+            RefKind::Local => items.push(item("New worktree from here…", wt(&rf.name, None, String::new()))),
             RefKind::Remote => {
                 let b = local_twin.clone().unwrap_or_default();
                 if self.local_names.contains(&b) {
-                    items.push(item(format!("Check out {b}"), Act::Checkout(b)));
+                    items.push(item(format!("Check out {b}"), Act::Checkout(b.clone())));
+                    let free = self.branch_free(&b).then(|| b.clone());
+                    items.push(item("New worktree from here…", wt(&rf.name, free, String::new())));
                 } else {
-                    items.push(item(format!("Check out as local '{b}'"), Act::Checkout(b)));
+                    items.push(item(format!("Check out as local '{b}'"), Act::Checkout(b.clone())));
+                    items.push(item(format!("Check out as local '{b}' in new worktree…"), wt(&rf.name, None, b)));
                 }
             }
-            _ => {}
+            RefKind::Tag => items.push(item("New worktree from here…", wt(&rf.name, None, String::new()))),
         }
         let mut note = None;
         if !rf.is_head {
@@ -3589,7 +4268,7 @@ impl GitApp {
                 items.push(it);
             }
         }
-        if rf.kind == RefKind::Local && !rf.is_head {
+        if rf.kind == RefKind::Local && !rf.is_head && self.branch_worktree(&rf.name).is_none() {
             items.push(sep());
             items.push(danger(format!("Delete branch {}", rf.name), Act::DeleteBranch(rf.name.clone())));
         }
@@ -3945,6 +4624,39 @@ fn short_url(url: &str) -> String {
     }
 }
 
+/// Eight dots chasing each other around `c` (keeps the UI animating while shown).
+fn spinner(ui: &mut Ui, c: (f32, f32), color: Color) {
+    let phase = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis()) % 1000) as f32 / 1000.0;
+    for k in 0..8 {
+        let a = (k as f32 / 8.0 + phase) * std::f32::consts::TAU;
+        let alpha = 0.15 + 0.85 * (k as f32 / 8.0);
+        ui.p.circle((c.0 + a.cos() * 6.0, c.1 + a.sin() * 6.0), 1.4, color.alpha(alpha));
+    }
+    ui.animating = true;
+}
+
+/// Worktree paths an undo step removes (their tabs should close).
+fn removed_worktrees(u: &Undo) -> Vec<PathBuf> {
+    match u {
+        Undo::Cmd { args, .. } if args.len() >= 3 && args[0] == "worktree" && args[1] == "remove" => {
+            vec![PathBuf::from(args.last().unwrap())]
+        }
+        Undo::Many(items, _) => items.iter().flat_map(removed_worktrees).collect(),
+        _ => vec![],
+    }
+}
+
+/// Worktree paths an undo step adds back (undoing "remove worktree").
+fn added_worktrees(u: &Undo) -> Vec<PathBuf> {
+    match u {
+        Undo::Cmd { args, .. } if args.len() >= 3 && args[0] == "worktree" && args[1] == "add" => {
+            args[2..].iter().find(|a| !a.starts_with('-')).map(PathBuf::from).into_iter().collect()
+        }
+        Undo::Many(items, _) => items.iter().flat_map(added_worktrees).collect(),
+        _ => vec![],
+    }
+}
+
 /// Full ref name ("refs/heads/main", "refs/remotes/origin/main").
 fn ref_full(r: &Ref) -> String {
     match r.kind {
@@ -4134,6 +4846,243 @@ mod tests {
         assert!(h2.app.hidden.is_empty());
         assert!(has(&h2));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    impl Harness {
+        /// Runs frames until the background job (fetch / pull / push) has finished.
+        fn wait_job(&mut self) {
+            for _ in 0..200 {
+                if self.app.job.is_none() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+                self.frame();
+            }
+            panic!("background job didn't finish");
+        }
+        /// Runs frames until background worktree adds / removes have finished.
+        fn wait_wt_jobs(&mut self) {
+            for _ in 0..400 {
+                if self.app.wt_jobs.is_empty() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+                self.frame();
+            }
+            panic!("worktree job didn't finish");
+        }
+        fn menu_labels(&self) -> Vec<String> {
+            self.app.menu.as_ref().expect("menu open").items.iter().filter(|i| i.act.is_some()).map(|i| i.label.clone()).collect()
+        }
+    }
+
+    #[test]
+    fn worktrees_add_commit_redirect_remove_undo() {
+        let dir = temp_repo("wt");
+        let mut h = Harness::new(&dir);
+        h.app.in_tab = true;
+        assert!(h.app.other_worktrees().is_empty());
+
+        // New worktree on a new branch, through the prompt the "+" opens.
+        let from = h.app.wt_from_selection().unwrap();
+        h.app.act(Act::NewWorktree(from));
+        h.frame();
+        assert!(h.app.palette.worktree_from.is_some());
+        h.type_text("wt-topic");
+        let item = &h.app.palette.items[0];
+        assert!(item.label.starts_with("New branch 'wt-topic'"), "{}", item.label);
+        let Act::AddWorktree { path, .. } = item.act.clone() else { panic!() };
+        assert!(path.ends_with(&format!("{}-wt-topic", dir.file_name().unwrap().to_string_lossy())), "{path}");
+        h.key(Key::Enter);
+        // The checkout runs in the background: a busy row until it's done, then a tab.
+        assert!(h.app.sidebar_worktrees().iter().any(|(w, busy)| w.path.ends_with(format!("{}-wt-topic", dir.file_name().unwrap().to_string_lossy())) && *busy == Some("adding…")));
+        assert!(h.app.open_requests.is_empty());
+        h.wait_wt_jobs();
+        let others = h.app.other_worktrees();
+        assert_eq!(others.len(), 1);
+        assert_eq!(others[0].branch.as_deref(), Some("wt-topic"));
+        let wt = others[0].path.clone();
+        assert_eq!(h.app.open_requests, vec![wt.clone()], "the new worktree opens in a tab");
+        h.app.open_requests.clear();
+
+        // Inside the worktree: stage and commit like in any working copy.
+        let mut w = Harness::new(&wt);
+        std::fs::write(wt.join("three"), "3").unwrap();
+        w.app.reload_all(false);
+        assert_eq!(w.app.changes.len(), 1);
+        w.app.act(Act::StageAll);
+        w.app.msg.set("from the worktree");
+        w.app.act(Act::Commit);
+        assert!(w.app.changes.is_empty());
+        assert_eq!(w.app.repo.as_ref().unwrap().last_message(), "from the worktree");
+        assert_eq!(w.branch(), "wt-topic");
+        // The worktree's tab sees the main working copy as another worktree.
+        assert!(w.app.other_worktrees().iter().any(|o| o.branch.as_deref() == Some("main")));
+
+        // Back in the main tab: the branch moved, and checking it out goes to its worktree.
+        h.app.reload_all(false);
+        let repo = h.app.repo.as_ref().unwrap();
+        assert_eq!(repo.git(&["log", "-1", "--format=%s", "wt-topic"]).unwrap().trim(), "from the worktree");
+        h.app.act(Act::Checkout("wt-topic".into()));
+        assert_eq!(h.branch(), "main");
+        assert_eq!(h.app.open_requests, vec![wt.clone()]);
+
+        // Dirty worktrees aren't removed.
+        std::fs::write(wt.join("dirty"), "x").unwrap();
+        h.app.reload_all(false);
+        h.app.act(Act::RemoveWorktree(wt.display().to_string()));
+        assert!(wt.exists());
+        assert!(h.app.toast.as_ref().is_some_and(|t| t.err));
+        std::fs::remove_file(wt.join("dirty")).unwrap();
+        h.app.reload_all(false);
+
+        // Clean: removed on a background thread. Its tab closes right away, the row shows it's
+        // being removed, and undo waits until git is done.
+        let steps = h.app.undo.len();
+        h.app.act(Act::RemoveWorktree(wt.display().to_string()));
+        assert_eq!(h.app.close_requests, vec![wt.clone()]);
+        assert!(h.app.sidebar_worktrees().iter().any(|(w, busy)| w.path == wt && *busy == Some("removing…")));
+        h.app.undo();
+        assert_eq!(h.app.undo.len(), steps, "no undo while a removal is in flight");
+        h.wait_wt_jobs();
+        assert!(!wt.exists());
+        assert!(h.app.sidebar_worktrees().is_empty());
+        assert_eq!(h.app.undo.len(), steps + 1);
+        // Undo checks it out again (in the background too), on the same branch.
+        h.app.undo();
+        assert!(h.app.sidebar_worktrees().iter().any(|(w, busy)| w.path == wt && *busy == Some("adding…")));
+        h.wait_wt_jobs();
+        assert!(wt.join("three").exists());
+        assert_eq!(h.app.other_worktrees()[0].branch.as_deref(), Some("wt-topic"));
+
+        // Undoing the add removes the worktree (in the background too) and its branch.
+        h.app.close_requests.clear();
+        h.app.undo();
+        assert_eq!(h.app.close_requests, vec![wt.clone()]);
+        h.wait_wt_jobs();
+        assert!(!wt.exists());
+        assert!(h.app.repo.as_ref().unwrap().rev_parse("refs/heads/wt-topic").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stage_and_unstage_lines_of_a_new_file_in_a_worktree() {
+        let dir = temp_repo("wt-lines");
+        let wt = dir.with_file_name(format!("{}-wt", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&wt);
+        git::run(&dir, &["worktree", "add", "-q", "-b", "lines", wt.to_str().unwrap()], None).unwrap();
+        std::fs::write(wt.join("new"), "x\ny\nz\n").unwrap();
+        let mut h = Harness::new(&wt);
+        assert_eq!(h.app.wip_file, Some(("new".to_string(), false)));
+        assert!(h.app.diff.mode == DiffMode::Untracked);
+        let show = |h: &Harness| h.app.repo.as_ref().unwrap().git(&["show", ":new"]);
+
+        // Stage "y" and "z" from the untracked file.
+        h.app.diff.selected.extend([(0, 0, 1), (0, 0, 2)]);
+        h.app.apply_diff_action(DiffAction::Hunk { f: 0, h: 0, lines_only: true });
+        assert!(h.app.toast.as_ref().is_none_or(|t| !t.err), "{:?}", h.app.toast.as_ref().map(|t| &t.msg));
+        assert_eq!(show(&h).unwrap(), "y\nz\n");
+
+        // Switch to the staged side of the file and unstage "y" again.
+        h.app.wip_file = Some(("new".into(), true));
+        h.app.load_wip_diff();
+        assert!(h.app.diff.mode == DiffMode::Staged);
+        let y = h.app.diff.files[0].hunks[0].lines.iter().position(|l| l == "+y").unwrap();
+        h.app.diff.selected.insert((0, 0, y));
+        h.app.apply_diff_action(DiffAction::Hunk { f: 0, h: 0, lines_only: true });
+        assert!(h.app.toast.as_ref().is_none_or(|t| !t.err), "{:?}", h.app.toast.as_ref().map(|t| &t.msg));
+        assert_eq!(show(&h).unwrap(), "z\n");
+        let _ = git::run(&dir, &["worktree", "remove", "--force", wt.to_str().unwrap()], None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wide_working_copy_puts_the_staging_column_left_of_the_diff() {
+        let dir = temp_repo("wide-wip");
+        std::fs::write(dir.join("one"), "1\n").unwrap();
+        std::fs::write(dir.join("two"), "2\n").unwrap();
+        let mut h = Harness::new(&dir);
+        h.app.wide = true;
+        h.frame();
+        // Column: "Working copy" header (44), UNSTAGED header (30), then one row per file.
+        // (Stacked, x = 100 would be in the sidebar.)
+        let row = |i: usize| TOP_H + 44.0 + 30.0 + i as f32 * LIST_ROW_H + LIST_ROW_H * 0.5;
+        h.click(100.0, row(1));
+        assert_eq!(h.app.wip_file, Some(("two".to_string(), false)));
+        assert_eq!(h.app.diff.files[0].path, "two");
+        // Each row's Stage button sits at the column's right edge.
+        let col_right = 1.0 + h.app.stage_col_w(1399.0);
+        h.click(col_right - 6.0 - 30.0, row(1));
+        assert!(h.app.changes.iter().any(|c| c.path == "two" && c.staged() && !c.unstaged()));
+        // Dragging the divider resizes the column.
+        h.ui.input.mouse = (col_right - 2.0, 500.0);
+        h.ui.input.pressed = true;
+        h.ui.input.down = true;
+        h.frame();
+        h.ui.input.mouse = (600.0, 500.0);
+        h.frame();
+        h.ui.input.down = false;
+        h.frame();
+        assert_eq!(h.app.stage_col_w(1399.0), 599.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_and_pull_pick_a_remote() {
+        let dir = temp_repo("pull");
+        let up = dir.with_file_name(format!("{}-up.git", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&up);
+        git::run(&dir, &["clone", "-q", "--bare", ".", up.to_str().unwrap()], None).unwrap();
+        git::run(&dir, &["remote", "add", "origin", up.to_str().unwrap()], None).unwrap();
+        git::run(&dir, &["fetch", "-q", "origin"], None).unwrap();
+        git::run(&dir, &["branch", "-q", "-u", "origin/main"], None).unwrap();
+        // Someone else pushes a commit.
+        let other = dir.with_file_name(format!("{}-other", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&other);
+        git::run(&dir, &["clone", "-q", up.to_str().unwrap(), other.to_str().unwrap()], None).unwrap();
+        std::fs::write(other.join("theirs"), "t").unwrap();
+        for args in [&["add", "."][..], &["-c", "user.name=O", "-c", "user.email=o@example.com", "commit", "-qm", "theirs"], &["push", "-q"]] {
+            git::run(&other, args, None).unwrap();
+        }
+
+        let mut h = Harness::new(&dir);
+        h.app.open_fetch_menu((900.0, 60.0));
+        h.frame();
+        assert_eq!(h.menu_labels(), vec!["origin  (upstream)"]);
+        h.click_menu_item("origin");
+        h.wait_job();
+        assert!(h.app.toast.as_ref().is_some_and(|t| t.msg == "Fetched origin"), "{:?}", h.app.toast.as_ref().map(|t| &t.msg));
+
+        h.app.open_pull_menu((900.0, 60.0));
+        h.frame();
+        let m = h.app.menu.as_ref().unwrap();
+        assert_eq!(m.items[0].label, "origin/main  (upstream)");
+        assert!(m.items[0].detail.starts_with("↓1"), "{}", m.items[0].detail);
+        h.click_menu_item("origin/main");
+        h.wait_job();
+        assert_eq!(h.app.repo.as_ref().unwrap().last_message(), "theirs");
+
+        // Diverged: rebase and merge are offered.
+        std::fs::write(dir.join("mine"), "m").unwrap();
+        git::run(&dir, &["add", "."], None).unwrap();
+        git::run(&dir, &["commit", "-qm", "mine"], None).unwrap();
+        std::fs::write(other.join("theirs2"), "t").unwrap();
+        for args in [&["add", "."][..], &["-c", "user.name=O", "-c", "user.email=o@example.com", "commit", "-qm", "theirs 2"], &["push", "-q"]] {
+            git::run(&other, args, None).unwrap();
+        }
+        git::run(&dir, &["fetch", "-q", "origin"], None).unwrap();
+        h.app.reload_all(false);
+        h.app.open_pull_menu((900.0, 60.0));
+        h.frame();
+        assert_eq!(h.menu_labels(), vec!["origin/main  (upstream)", "Rebase onto origin/main", "Merge origin/main"]);
+        h.click_menu_item("Rebase onto");
+        h.wait_job();
+        let repo = h.app.repo.as_ref().unwrap();
+        assert_eq!(repo.last_message(), "mine");
+        assert!(repo.is_ancestor("origin/main", "HEAD"));
+        for d in [&dir, &up, &other] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     #[test]

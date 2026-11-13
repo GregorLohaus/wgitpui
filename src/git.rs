@@ -435,7 +435,7 @@ impl Repo {
 
     pub fn diff_file(&self, path: &str, staged: bool, o: &DiffOpts) -> Result<Vec<FileDiff>, String> {
         let ctx = o.context_arg();
-        let mut args = vec!["diff", "--no-color", "--no-ext-diff", "-M", &ctx];
+        let mut args = vec!["diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "-M", &ctx];
         if o.ignore_ws {
             args.push("-w");
         }
@@ -446,27 +446,24 @@ impl Repo {
         Ok(parse_diff(&self.git(&args)?))
     }
 
-    /// Untracked files have no diff; synthesize an all-additions view of the file.
+    /// An untracked file as a real "new file" patch (`git diff --no-index`), so selected lines
+    /// can be staged or discarded like in any other diff.
     pub fn untracked_diff(&self, path: &str) -> FileDiff {
-        let full = self.root.join(path);
-        let mut fd = FileDiff { path: path.to_string(), ..Default::default() };
-        match std::fs::read(&full) {
-            Ok(bytes) if bytes.len() > 2_000_000 => fd.binary = true,
-            Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(s) => {
-                    let lines: Vec<String> = s.lines().map(|l| format!("+{l}")).collect();
-                    fd.adds = lines.len() as u32;
-                    fd.hunks.push(Hunk {
-                        header: format!("@@ -0,0 +1,{} @@ new file", lines.len()),
-                        old_start: 0,
-                        new_start: 1,
-                        lines,
-                    });
-                }
-                Err(_) => fd.binary = true,
-            },
-            Err(_) => fd.binary = true,
+        let whole = FileDiff { path: path.to_string(), binary: true, ..Default::default() };
+        // Huge and non-UTF-8 files are only handled as a whole.
+        match std::fs::read(self.root.join(path)) {
+            Ok(b) if b.len() <= 2_000_000 && std::str::from_utf8(&b).is_ok() => {}
+            _ => return whole,
         }
+        let args = ["diff", "--no-index", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "--", "/dev/null", path];
+        // Exit code 1 means "differences found".
+        let Ok((0 | 1, out, _)) = run_full(&self.root, &args) else { return whole };
+        let Some(mut fd) = parse_diff(&out).pop() else { return whole };
+        if fd.hunks.is_empty() && !fd.binary {
+            // Empty file: an empty hunk still carries the Stage / Delete buttons.
+            fd.hunks.push(Hunk { header: "@@ -0,0 +1,0 @@ empty file".into(), old_start: 0, new_start: 1, lines: vec![] });
+        }
+        fd.path = path.to_string();
         fd
     }
 
@@ -621,7 +618,7 @@ impl Repo {
 
     /// The full unstaged patch of one file, binary-safe.
     pub fn file_patch(&self, path: &str) -> Result<String, String> {
-        self.git(&["diff", "--binary", "--no-color", "--no-ext-diff", "--", path])
+        self.git(&["diff", "--binary", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "--", path])
     }
 
     pub fn op_in_progress(&self) -> Option<OpKind> {
@@ -785,6 +782,84 @@ impl Repo {
     pub fn last_message(&self) -> String {
         self.git(&["log", "-1", "--format=%B"]).map(|s| s.trim_end().to_string()).unwrap_or_default()
     }
+
+    /// Every working tree of this repository (the main one first), from `git worktree list`.
+    pub fn worktrees(&self) -> Vec<Worktree> {
+        parse_worktrees(&self.git(&["worktree", "list", "--porcelain"]).unwrap_or_default())
+    }
+
+    /// `git worktree add`: check out `rev` at `path`, optionally on a new branch, or detached.
+    pub fn worktree_add(&self, path: &str, rev: &str, new_branch: Option<&str>, detach: bool) -> Result<String, String> {
+        let mut args = vec!["worktree", "add"];
+        if let Some(b) = new_branch {
+            args.extend(["-b", b]);
+        } else if detach {
+            args.push("--detach");
+        }
+        args.extend(["--", path, rev]);
+        self.git(&args)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Worktree {
+    pub path: PathBuf,
+    pub head: String,
+    /// Checked-out branch (short name); None when detached or bare.
+    pub branch: Option<String>,
+    pub bare: bool,
+    pub locked: bool,
+    /// The directory is gone; `git worktree prune` would drop the entry.
+    pub prunable: bool,
+    /// Changed files (filled in by the caller; listing doesn't run status).
+    pub changes: usize,
+}
+
+impl Worktree {
+    pub fn name(&self) -> String {
+        self.path.file_name().map_or_else(|| self.path.display().to_string(), |n| n.to_string_lossy().into())
+    }
+}
+
+pub fn parse_worktrees(out: &str) -> Vec<Worktree> {
+    let mut v: Vec<Worktree> = Vec::new();
+    for line in out.lines() {
+        let (key, val) = line.split_once(' ').unwrap_or((line, ""));
+        if key == "worktree" {
+            v.push(Worktree { path: PathBuf::from(val), ..Default::default() });
+            continue;
+        }
+        let Some(w) = v.last_mut() else { continue };
+        match key {
+            "HEAD" => w.head = val.to_string(),
+            "branch" => w.branch = Some(val.strip_prefix("refs/heads/").unwrap_or(val).to_string()),
+            "bare" => w.bare = true,
+            "locked" => w.locked = true,
+            "prunable" => w.prunable = true,
+            _ => {}
+        }
+    }
+    v
+}
+
+/// Number of changed files in the working tree at `root` (cheap: untracked dirs aren't expanded).
+pub fn change_count(root: &Path) -> usize {
+    let Ok(out) = run(root, &["status", "--porcelain=v1", "-z", "--untracked-files=normal"], None) else { return 0 };
+    let (mut n, mut it) = (0, out.split('\0'));
+    while let Some(e) = it.next() {
+        if e.len() >= 4 {
+            n += 1;
+            if matches!(e.as_bytes()[0], b'R' | b'C') {
+                it.next(); // a rename's original path is its own field
+            }
+        }
+    }
+    n
+}
+
+/// Path equality that sees through symlinks (macOS /tmp → /private/tmp) and trailing slashes.
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
 
 pub fn parse_diff(text: &str) -> Vec<FileDiff> {
@@ -841,11 +916,6 @@ pub fn parse_diff(text: &str) -> Vec<FileDiff> {
 /// `-R`) it's the mirror image. Hunk counts are recomputed by `git apply --recount`.
 pub fn hunk_patch(file: &FileDiff, hunk: usize, selected: Option<&dyn Fn(usize) -> bool>, reverse: bool) -> String {
     let h = &file.hunks[hunk];
-    let mut out = String::new();
-    for l in &file.header {
-        out.push_str(l);
-        out.push('\n');
-    }
     let mut body = String::new();
     let (mut old_n, mut new_n) = (0, 0);
     let mut last_kept = false;
@@ -870,9 +940,42 @@ pub fn hunk_patch(file: &FileDiff, hunk: usize, selected: Option<&dyn Fn(usize) 
             _ => keep(line.clone(), 1, 1),
         };
     }
-    out.push_str(&format!("@@ -{},{} +{},{} @@\n", h.old_start, old_n, h.new_start, new_n));
+    // A partial selection can leave lines on the side the header says is empty: lines unstaged
+    // from (or discarded in) a new file, lines staged from a deleted one. Git rejects that
+    // ("new file depends on old contents"), so such a patch becomes a plain modification.
+    let created = file.header.iter().any(|l| l.starts_with("new file mode"));
+    let deleted = file.header.iter().any(|l| l.starts_with("deleted file mode"));
+    let header = if (created && old_n > 0) || (deleted && new_n > 0) { modification_header(&file.header) } else { file.header.clone() };
+    let mut out = String::new();
+    for l in &header {
+        out.push_str(l);
+        out.push('\n');
+    }
+    // A side with lines starts at line 1 (new and deleted files number the empty side 0).
+    let start = |s: u32, n: u32| if n > 0 { s.max(1) } else { s };
+    out.push_str(&format!("@@ -{},{} +{},{} @@\n", start(h.old_start, old_n), old_n, start(h.new_start, new_n), new_n));
     out.push_str(&body);
     out
+}
+
+/// A new-file or deleted-file patch header rewritten as a modification of the same path.
+fn modification_header(header: &[String]) -> Vec<String> {
+    // "b/path" → "a/path" and back; names git had to quote keep their quotes.
+    let swap = |name: &str, prefix: &str| match name.strip_prefix('"') {
+        Some(q) => format!("\"{prefix}{}", q.get(1..).unwrap_or("")),
+        None => format!("{prefix}{}", name.get(1..).unwrap_or("")),
+    };
+    let new_name = header.iter().find_map(|l| l.strip_prefix("+++ ")).filter(|n| *n != "/dev/null");
+    let old_name = header.iter().find_map(|l| l.strip_prefix("--- ")).filter(|n| *n != "/dev/null");
+    header
+        .iter()
+        .filter(|l| !l.starts_with("new file mode") && !l.starts_with("deleted file mode") && !l.starts_with("index "))
+        .map(|l| match (l.as_str(), new_name, old_name) {
+            ("--- /dev/null", Some(n), _) => format!("--- {}", swap(n, "a")),
+            ("+++ /dev/null", _, Some(o)) => format!("+++ {}", swap(o, "b")),
+            _ => l.clone(),
+        })
+        .collect()
 }
 
 /// Where a side of a diff comes from, for line attribution.
@@ -982,6 +1085,101 @@ mod tests {
         run(&dir, &["add", "."], None).unwrap();
         run(&dir, &["commit", "-qm", "init"], None).unwrap();
         Repo::open(&dir).unwrap()
+    }
+
+    /// Indices of the hunk lines equal to one of `want` (e.g. "+y").
+    fn pick(fd: &FileDiff, want: &[&str]) -> Vec<usize> {
+        fd.hunks[0].lines.iter().enumerate().filter(|(_, l)| want.contains(&l.as_str())).map(|(i, _)| i).collect()
+    }
+
+    #[test]
+    fn line_staging_on_new_and_deleted_files_in_a_worktree() {
+        let main = temp_repo("newfile-lines");
+        let wt_dir = main.root.with_file_name(format!("{}-wt", main.root.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&wt_dir);
+        main.git(&["worktree", "add", "-q", "-b", "wt", wt_dir.to_str().unwrap()]).unwrap();
+        let repo = Repo::open(&wt_dir).unwrap();
+        let index = |p: &str| repo.git(&["show", &format!(":{p}")]).unwrap();
+
+        // Untracked: stage one line, then the last one (which has no trailing newline).
+        std::fs::write(repo.root.join("u"), "x\ny\nz").unwrap();
+        let fd = repo.untracked_diff("u");
+        assert!(fd.header.iter().any(|l| l.starts_with("new file mode")), "{:?}", fd.header);
+        let sel = pick(&fd, &["+y"]);
+        repo.apply_cached(&hunk_patch(&fd, 0, Some(&|i| sel.contains(&i)), false), false).unwrap();
+        assert_eq!(index("u"), "y\n");
+        let fd = &repo.diff_file("u", false, &DiffOpts::default()).unwrap()[0];
+        let sel = pick(fd, &["+z"]);
+        repo.apply_cached(&hunk_patch(fd, 0, Some(&|i| sel.contains(&i)), false), false).unwrap();
+        assert_eq!(index("u"), "y\nz");
+
+        // Staged new file: unstage one line (this used to fail with
+        // "new file n depends on old contents").
+        std::fs::write(repo.root.join("n"), "1\n2\n3\n").unwrap();
+        repo.stage(&["n"]).unwrap();
+        let fd = &repo.diff_file("n", true, &DiffOpts::default()).unwrap()[0];
+        let sel = pick(fd, &["+2"]);
+        repo.apply_cached(&hunk_patch(fd, 0, Some(&|i| sel.contains(&i)), true), true).unwrap();
+        assert_eq!(index("n"), "1\n3\n");
+        assert_eq!(std::fs::read_to_string(repo.root.join("n")).unwrap(), "1\n2\n3\n", "working tree untouched");
+        // Unstaging every line takes the file out of the index again.
+        let fd = &repo.diff_file("n", true, &DiffOpts::default()).unwrap()[0];
+        let sel = pick(fd, &["+1", "+3"]);
+        repo.apply_cached(&hunk_patch(fd, 0, Some(&|i| sel.contains(&i)), true), true).unwrap();
+        assert!(repo.git(&["ls-files", "--", "n"]).unwrap().trim().is_empty());
+
+        // Untracked: discard one line, then undo.
+        std::fs::write(repo.root.join("d"), "p\nq\nr\n").unwrap();
+        let fd = repo.untracked_diff("d");
+        let sel = pick(&fd, &["+q"]);
+        let patch = hunk_patch(&fd, 0, Some(&|i| sel.contains(&i)), true);
+        repo.apply_worktree(&patch, true).unwrap();
+        assert_eq!(std::fs::read_to_string(repo.root.join("d")).unwrap(), "p\nr\n");
+        repo.apply_worktree(&patch, false).unwrap();
+        assert_eq!(std::fs::read_to_string(repo.root.join("d")).unwrap(), "p\nq\nr\n");
+
+        // Deleted in the working tree: stage the removal of one line.
+        std::fs::remove_file(repo.root.join("f.txt")).unwrap();
+        let fd = &repo.diff_file("f.txt", false, &DiffOpts::default()).unwrap()[0];
+        let sel = pick(fd, &["-b"]);
+        repo.apply_cached(&hunk_patch(fd, 0, Some(&|i| sel.contains(&i)), false), false).unwrap();
+        assert_eq!(index("f.txt"), "a\nc\nd\n");
+
+        // Staged deletion: unstage the removal of one line.
+        std::fs::write(repo.root.join("g"), "k\nl\nm\n").unwrap();
+        repo.stage(&["g"]).unwrap();
+        repo.commit("g", false).unwrap();
+        repo.git(&["rm", "-q", "g"]).unwrap();
+        let fd = &repo.diff_file("g", true, &DiffOpts::default()).unwrap()[0];
+        let sel = pick(fd, &["-l"]);
+        repo.apply_cached(&hunk_patch(fd, 0, Some(&|i| sel.contains(&i)), true), true).unwrap();
+        assert_eq!(index("g"), "l\n");
+
+        let _ = main.git(&["worktree", "remove", "--force", wt_dir.to_str().unwrap()]);
+        let _ = std::fs::remove_dir_all(&main.root);
+    }
+
+    #[test]
+    fn parses_worktree_list() {
+        let out = "worktree /code/app\nHEAD 1111111111111111111111111111111111111111\nbranch refs/heads/main\n\n\
+                   worktree /code/app-x\nHEAD 2222222222222222222222222222222222222222\ndetached\nlocked reason\n\n\
+                   worktree /code/gone\nHEAD 3333333333333333333333333333333333333333\nbranch refs/heads/feature/y\nprunable gitdir file points to non-existent location\n";
+        let w = parse_worktrees(out);
+        assert_eq!(w.len(), 3);
+        assert_eq!((w[0].path.to_str(), w[0].branch.as_deref()), (Some("/code/app"), Some("main")));
+        assert!(w[1].branch.is_none() && w[1].locked && !w[1].prunable);
+        assert_eq!(w[2].branch.as_deref(), Some("feature/y"));
+        assert!(w[2].prunable);
+        assert_eq!(w[1].name(), "app-x");
+    }
+
+    #[test]
+    fn counts_changes_with_renames() {
+        let repo = temp_repo("count");
+        assert_eq!(change_count(&repo.root), 0);
+        repo.git(&["mv", "f.txt", "g.txt"]).unwrap();
+        std::fs::write(repo.root.join("new"), "n").unwrap();
+        assert_eq!(change_count(&repo.root), 2);
     }
 
     #[test]
