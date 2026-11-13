@@ -21,6 +21,8 @@ mod graph;
 mod png;
 mod rebase;
 mod resolve;
+#[cfg(unix)]
+mod shellenv;
 mod syntax;
 mod workspace;
 mod ui;
@@ -365,6 +367,11 @@ fn main() {
         }
         return;
     }
+    // Started from the Dock, Finder or Spotlight: git and ssh get PATH, SSH_AUTH_SOCK and the rest
+    // from the user's shell rather than launchd. This changes the environment, so it comes before any
+    // thread starts.
+    #[cfg(unix)]
+    shellenv::adopt();
     let fonts = match font::Fonts::load() {
         Ok(f) => f,
         Err(e) => {

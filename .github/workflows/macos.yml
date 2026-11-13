@@ -1,6 +1,6 @@
 # Tests, then builds a universal (arm64 + x86_64) Wgitpui.app with the CLI inside, packaged as
 # .dmg and .zip. Every run uploads them as workflow artifacts; pushing a `v*` tag also
-# publishes them on a GitHub release.
+# publishes them on a GitHub release and points the Homebrew cask in <owner>/homebrew-tap at it.
 name: macOS app
 
 on:
@@ -68,3 +68,31 @@ jobs:
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
             || gh release create "$GITHUB_REF_NAME" --title "Wgitpui $GITHUB_REF_NAME" --generate-notes
           gh release upload "$GITHUB_REF_NAME" dist/*.dmg dist/*.zip --clobber
+
+      # Points `brew install --cask <owner>/tap/wgitpui` at this release. Needs a HOMEBREW_TAP_TOKEN
+      # secret: a fine-grained token with Contents read/write on the <owner>/homebrew-tap repo.
+      - name: Update Homebrew cask
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP: ${{ github.repository_owner }}/homebrew-tap
+        run: |
+          if [[ -z "$TAP_TOKEN" ]]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN isn't set, so $TAP still has the previous version"
+            exit 0
+          fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          git clone -q --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/${TAP}.git" tap
+          # A tap created without any commit gets a main branch.
+          git -C tap rev-parse -q --verify HEAD >/dev/null || git -C tap symbolic-ref HEAD refs/heads/main
+          mkdir -p tap/Casks
+          REPO="$GITHUB_REPOSITORY" scripts/homebrew-cask.sh "$VERSION" "dist/Wgitpui-$VERSION-macos.zip" > tap/Casks/wgitpui.rb
+          cd tap
+          git add Casks/wgitpui.rb
+          if git diff --cached --quiet; then
+            echo "The cask is already at $VERSION"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "wgitpui $VERSION"
+          git push -q origin HEAD

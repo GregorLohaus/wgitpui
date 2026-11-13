@@ -70,12 +70,23 @@ Everything else is in-tree:
 
 ## Install (macOS)
 
-Download `Wgitpui-<version>-macos.dmg` from the GitHub release (or the workflow artifacts), drag
+With [Homebrew](https://brew.sh):
+
+```sh
+brew install --cask GregorLohaus/tap/wgitpui
+```
+
+This puts **Wgitpui** in Applications and the `wgitpui` command on your PATH; `brew upgrade`
+picks up new releases.
+
+Or download `Wgitpui-<version>-macos.dmg` from the GitHub release (or the workflow artifacts), drag
 **Wgitpui** into Applications, then put the command on your PATH, either with
 *Install command line tool.command* from the disk image or with *Install 'wgitpui' command* in
 the app's ⌘K palette.
 
-The build is ad-hoc signed, not notarized: the first time, right-click the app → Open.
+Release builds are ad-hoc signed, not notarized. The cask clears the quarantine flag, so a Homebrew
+install opens right away. A downloaded app has to be allowed once: open it, then choose
+*Open Anyway* in System Settings → Privacy & Security.
 
 ## Command line
 
@@ -90,6 +101,20 @@ window comes forward) through a per-user socket. If the app isn't running, it st
 background: via LaunchServices when installed as `Wgitpui.app`, otherwise as a detached process
 in its own session. Either way the shell is usable immediately.
 
+## SSH and your shell environment
+
+The app isn't sandboxed: git and ssh read `~/.ssh` (config, keys, known_hosts) just as they do in a
+terminal. The environment is what can differ. Started with `wgitpui`, the app inherits your
+terminal's; started from the Dock, Finder or Spotlight, it would get launchd's: a bare PATH and
+macOS's own SSH agent. So in that case it first takes the environment of your login shell, and if
+that still leaves ssh with an empty macOS agent, it uses the `SSH_AUTH_SOCK` your fish, zsh or bash
+profile sets (Bitwarden, 1Password, Secretive, gpg-agent…). An `IdentityAgent` in `~/.ssh/config`
+beats both, in the app and in your terminal.
+
+ssh can't ask you anything from inside the app: keys have to come from an agent, the macOS keychain
+(`UseKeychain yes`) or have no passphrase, and a new host needs one connection from a terminal to
+get into known_hosts.
+
 ## Building the app bundle
 
 ```sh
@@ -100,6 +125,10 @@ scripts/bundle-macos.sh --universal   # arm64 + x86_64
 The icon is `assets/icon.svg`; the script renders it into `AppIcon.icns` (with `rsvg-convert`
 if installed, otherwise macOS Quick Look). `.github/workflows/macos.yml` runs the tests and the
 universal bundle on every push, and publishes the `.dmg` / `.zip` to a GitHub release for `v*` tags.
+It then points the Homebrew cask at that release: `scripts/homebrew-cask.sh` writes
+`Casks/wgitpui.rb`, which the workflow pushes to `GregorLohaus/homebrew-tap`. That step needs a
+`HOMEBREW_TAP_TOKEN` repository secret, a fine-grained token with *Contents: Read and write* on
+the tap repository only; without it the release still goes out and the cask stays where it was.
 
 ## Run
 

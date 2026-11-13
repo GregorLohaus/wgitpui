@@ -3673,7 +3673,7 @@ impl GitApp {
             if let Some(h) = self.sel_row().map(|i| self.commits[i].hash.clone()).or_else(|| self.repo.as_ref()?.rev_parse("HEAD")) {
                 actions.push(("New branch…", "from the selected commit · or just type a name".into(), Act::PromptBranchAt(h)));
             }
-            if crate::cli::app_bundle().is_some() {
+            if crate::cli::app_bundle().is_some() && !crate::cli::command_installed() {
                 actions.push(("Install 'wgitpui' command", "open repos from the terminal".into(), Act::InstallCli));
             }
             actions.push(("Pull with rebase", "git pull --rebase --autostash".into(), Act::PullRebase));

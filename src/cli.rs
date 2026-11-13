@@ -130,6 +130,15 @@ pub fn launch_detached(paths: &[PathBuf]) -> Result<(), String> {
     cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
+/// Whether a `wgitpui` on the PATH already runs this executable (Homebrew's link into the app, or
+/// an earlier *Install 'wgitpui' command*).
+pub fn command_installed() -> bool {
+    let (Ok(exe), Some(path)) = (std::env::current_exe().and_then(|e| e.canonicalize()), std::env::var_os("PATH")) else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join("wgitpui").canonicalize().is_ok_and(|p| p == exe))
+}
+
 /// Puts a `wgitpui` command on the PATH pointing at the binary inside the app bundle.
 /// Blocking (may show the macOS administrator prompt); run off the UI thread.
 pub fn install_command() -> Result<String, String> {
