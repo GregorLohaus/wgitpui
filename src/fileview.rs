@@ -241,6 +241,10 @@ pub struct TreeView {
     rows: Vec<TRow>,
     pub scroll: Scroll,
     pub error: Option<String>,
+    /// The file that's open next to the tree (highlighted; set with `select`).
+    pub selected: Option<String>,
+    /// Scroll the selected file into view on the next draw.
+    reveal: bool,
 }
 
 impl TreeView {
@@ -250,6 +254,8 @@ impl TreeView {
             return;
         }
         self.rev = rev.to_string();
+        // Another commit's tree: the open file gets revealed again by the next `select`.
+        self.selected = None;
         match repo.ls_tree(rev) {
             Ok(mut f) => {
                 f.sort_by(|a, b| a.split('/').cmp(b.split('/')));
@@ -273,6 +279,25 @@ impl TreeView {
         }
         self.changed = changed.into_iter().collect();
         self.rebuild();
+    }
+
+    /// Highlights `path`, the file open next to the tree. A newly selected file's folders are
+    /// expanded and it's scrolled into view; after that the folders are the user's to collapse.
+    pub fn select(&mut self, path: Option<String>) {
+        if self.selected == path {
+            return;
+        }
+        if let Some((dirs, _)) = path.as_deref().and_then(|p| p.rsplit_once('/')) {
+            let mut prefix = String::new();
+            for part in dirs.split('/') {
+                prefix.push_str(part);
+                prefix.push('/');
+                self.expanded.insert(prefix.clone());
+            }
+            self.rebuild();
+        }
+        self.reveal = path.is_some();
+        self.selected = path;
     }
 
     fn rebuild(&mut self) {
@@ -313,6 +338,12 @@ impl TreeView {
             return None;
         }
         let rh = 22.0;
+        if std::mem::take(&mut self.reveal)
+            && let Some(i) = self.rows.iter().position(|t| !t.dir && self.selected.as_deref() == Some(t.path.as_str()))
+        {
+            let top = 4.0 + i as f32 * rh;
+            self.scroll.reveal(top, top + rh, r.h);
+        }
         let off = self.scroll.update(ui, r, self.rows.len() as f32 * rh + 12.0);
         let first = (off / rh) as usize;
         let last = (first + (r.h / rh) as usize + 2).min(self.rows.len());
@@ -323,8 +354,12 @@ impl TreeView {
             let row = Rect::new(r.x + 6.0, r.y + 4.0 + i as f32 * rh - off, r.w - 12.0, rh);
             let t = &self.rows[i];
             let hov = ui.hovered(row);
-            if hov {
+            if !t.dir && self.selected.as_deref() == Some(t.path.as_str()) {
+                ui.p.rounded(row, 5.0, theme::SELECT);
+            } else if hov {
                 ui.p.rounded(row, 5.0, theme::HOVER);
+            }
+            if hov {
                 ui.cursor = Cursor::Pointer;
             }
             let x = row.x + 10.0 + t.depth as f32 * 14.0;

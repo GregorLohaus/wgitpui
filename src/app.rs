@@ -42,8 +42,8 @@ enum Focus {
 enum Drag {
     None,
     Split,
-    /// The divider between the staging column and the diff (wide working copy).
-    StageSplit,
+    /// The divider between the left column and the diff (wide layouts).
+    ColSplit,
     Minimap,
     Scrubber,
 }
@@ -244,8 +244,8 @@ pub struct GitApp {
     staged_scroll: Scroll,
     files_scroll: Scroll,
     right_w: Option<f32>,
-    /// Width of the staging column in the wide working-copy layout (None = automatic).
-    stage_w: Option<f32>,
+    /// Width of the left column in wide layouts (working copy and commit; None = automatic).
+    col_w: Option<f32>,
     drag: Drag,
     gdrag: Option<GDrag>,
     // Feedback.
@@ -317,7 +317,7 @@ impl GitApp {
             staged_scroll: Scroll::default(),
             files_scroll: Scroll::default(),
             right_w: None,
-            stage_w: None,
+            col_w: None,
             drag: Drag::None,
             gdrag: None,
             toast: None,
@@ -2811,43 +2811,45 @@ impl GitApp {
         (click, toggle, discard)
     }
 
-    /// Width of the staging column when the working copy is shown wide.
-    fn stage_col_w(&self, panel_w: f32) -> f32 {
-        let auto = (panel_w * 0.3).clamp(340.0, 460.0);
-        self.stage_w.unwrap_or(auto).clamp(300.0, (panel_w - 480.0).max(300.0))
+    /// Wide mode splits the working copy and commit panels into two columns (when there's room).
+    fn columns(&self, r: Rect) -> bool {
+        self.wide && r.w >= 860.0
     }
 
-    /// Drag handle on the divider at `x` between the staging column and the diff.
-    fn stage_splitter(&mut self, ui: &mut Ui, x: f32, panel: Rect) {
-        // Just inside the column's margin, so it never overlaps file rows or the diff.
-        let handle = Rect::new(x - 5.0, panel.y, 6.0, panel.h);
-        if (ui.hovered(handle) && self.drag == Drag::None) || self.drag == Drag::StageSplit {
+    /// Width of the left column in wide layouts.
+    fn side_col_w(&self, panel_w: f32) -> f32 {
+        let auto = (panel_w * 0.3).clamp(340.0, 460.0);
+        self.col_w.unwrap_or(auto).clamp(300.0, (panel_w - 480.0).max(300.0))
+    }
+
+    /// Wide layout: a resizable column on the left (file lists, commit details) and the rest of
+    /// the panel, where the diff goes. Returns (column, rest).
+    fn split_columns(&mut self, ui: &mut Ui, r: Rect) -> (Rect, Rect) {
+        let mut rest = r;
+        let col = rest.take_left(self.side_col_w(r.w));
+        ui.p.rect(Rect::new(rest.x, rest.y, 1.0, rest.h), theme::BORDER);
+        // Drag handle just inside the column's margin, so it never overlaps rows or the diff.
+        let handle = Rect::new(rest.x - 5.0, r.y, 6.0, r.h);
+        if (ui.hovered(handle) && self.drag == Drag::None) || self.drag == Drag::ColSplit {
             ui.cursor = Cursor::ResizeH;
             if ui.input.pressed && self.drag == Drag::None {
-                self.drag = Drag::StageSplit;
+                self.drag = Drag::ColSplit;
             }
         }
-        if self.drag == Drag::StageSplit {
+        if self.drag == Drag::ColSplit {
             if ui.input.down {
-                self.stage_w = Some((ui.input.mouse.0 - panel.x).clamp(300.0, (panel.w - 480.0).max(300.0)));
+                self.col_w = Some((ui.input.mouse.0 - r.x).clamp(300.0, (r.w - 480.0).max(300.0)));
             } else {
                 self.drag = Drag::None;
             }
         }
+        (col, Rect::new(rest.x + 1.0, rest.y, rest.w - 1.0, rest.h))
     }
 
     fn wip_panel(&mut self, ui: &mut Ui, r: Rect) {
         // Wide: file lists and the commit message form a column on the left; the diff gets the rest.
-        let columns = self.wide && r.w >= 860.0;
-        let (mut area, diff_area) = if columns {
-            let mut rest = r;
-            let col = rest.take_left(self.stage_col_w(r.w));
-            ui.p.rect(Rect::new(rest.x, rest.y, 1.0, rest.h), theme::BORDER);
-            self.stage_splitter(ui, rest.x, r);
-            (col, Rect::new(rest.x + 1.0, rest.y, rest.w - 1.0, rest.h))
-        } else {
-            (r, Rect::default())
-        };
+        let columns = self.columns(r);
+        let (mut area, diff_area) = if columns { self.split_columns(ui, r) } else { (r, Rect::default()) };
         let head = area.take_top(44.0);
         ui.p.text(head.x + 16.0, head.cy(), UI, 15.0, "Working copy", theme::TEXT);
         let bw = ui.p.measure(UI, 12.0, &self.head_name);
@@ -3029,7 +3031,8 @@ impl GitApp {
         }
     }
 
-    fn commit_header(&mut self, ui: &mut Ui, area: &mut Rect, c: &Commit) -> Option<String> {
+    /// Subject, hash, author, date, parents and (up to `max_body` lines of) the message.
+    fn commit_header(&mut self, ui: &mut Ui, area: &mut Rect, c: &Commit, max_body: usize) -> Option<String> {
         let pad = 16.0;
         let width = area.w - 2.0 * pad;
         let (author, date, message) = self.info.clone().unwrap_or_default();
@@ -3039,7 +3042,7 @@ impl GitApp {
         let subj_lines = ui.p.wrap(UI, 15.5, &subject, width);
         let compact = self.tab == Tab::Files;
         let body_lines: Vec<String> = if body.is_empty() || compact { vec![] } else { ui.p.wrap(UI, 12.5, &body, width) };
-        let body_shown = body_lines.len().min(8);
+        let body_shown = body_lines.len().min(max_body);
         let subj_shown = if compact { 1 } else { subj_lines.len().min(3) };
         let header_h = 14.0 + subj_shown as f32 * 22.0 + 32.0 + body_shown as f32 * 18.0 + if body_shown > 0 { 8.0 } else { 0.0 };
         let head = area.take_top(header_h);
@@ -3390,13 +3393,36 @@ impl GitApp {
 
     fn commit_panel(&mut self, ui: &mut Ui, r: Rect, i: usize) {
         let c = self.commits[i].clone();
-        let mut area = r;
-        let goto = self.commit_header(ui, &mut area, &c);
+        // Wide: the commit's details and files (or its tree) form a column on the left, the diff
+        // (or the opened file) gets the rest. Same column as the working copy's.
+        let columns = self.columns(r);
+        let (mut area, mut main) = if columns { self.split_columns(ui, r) } else { (r, Rect::default()) };
+        let goto = self.commit_header(ui, &mut area, &c, if columns { 14 } else { 8 });
         let tabs_r = area.take_top(34.0);
         self.tabs(ui, tabs_r);
 
         match self.tab {
-            Tab::Changes => self.changes_tab(ui, area),
+            Tab::Changes => self.changes_tab(ui, area, columns.then_some(main)),
+            Tab::Files if columns => {
+                // The tree stays in the column; the timeline and the opened file go on the right.
+                let scrub = main.take_top(64.0);
+                self.scrubber(ui, scrub, i);
+                self.tree.select(self.file_view.as_ref().map(|f| f.path.clone()));
+                if let Some(TreeAction::Open(p)) = self.tree.draw(ui, area)
+                    && let Some(repo) = &self.repo
+                {
+                    self.file_view = Some(FileView::load(repo, Some(c.hash.clone()), p, false));
+                }
+                if self.file_view.is_some() {
+                    let a = self.file_view.as_mut().unwrap().draw(ui, main, true);
+                    self.file_action(a);
+                } else {
+                    ui.p.rect(main, theme::BG);
+                    let hint = "Pick a file to see it at this commit";
+                    let w = ui.p.measure(UI, 13.0, hint);
+                    ui.p.text(main.x + (main.w - w) * 0.5, main.y + main.h * 0.4, UI, 13.0, hint, theme::FAINT);
+                }
+            }
             Tab::Files => {
                 let scrub = area.take_top(64.0);
                 self.scrubber(ui, scrub, i);
@@ -3415,7 +3441,9 @@ impl GitApp {
         }
     }
 
-    fn changes_tab(&mut self, ui: &mut Ui, mut area: Rect) {
+    /// The commit's changed files, then its diff. With `diff_area` (wide layout) the list fills
+    /// the column (`area`) and the diff gets the area on the right.
+    fn changes_tab(&mut self, ui: &mut Ui, mut area: Rect, diff_area: Option<Rect>) {
         let nf = self.diff.files.len();
         let (adds, dels) = self.diff.files.iter().fold((0, 0), |(a, d), f| (a + f.adds, d + f.dels));
         let hdr = area.take_top(26.0);
@@ -3423,9 +3451,14 @@ impl GitApp {
         hx += ui.p.text(hx, hdr.cy(), UI, 11.0, &format!("{nf} FILE{}  ·  ", if nf == 1 { "" } else { "S" }), theme::FAINT);
         hx += ui.p.text(hx, hdr.cy(), MONO, 11.0, &format!("+{adds} "), theme::GREEN);
         ui.p.text(hx, hdr.cy(), MONO, 11.0, &format!("-{dels}"), theme::RED);
-        let list_r = area.take_top((nf.max(1) as f32 * 22.0).min(22.0 * 6.0) + 6.0);
+        let list_r = match diff_area {
+            Some(_) => area,
+            None => area.take_top((nf.max(1) as f32 * 22.0).min(22.0 * 6.0) + 6.0),
+        };
+        let mut diff_r = diff_area.unwrap_or(area);
+        let split = self.split_for(diff_r.w);
         let off = self.files_scroll.update(ui, list_r, nf as f32 * 22.0);
-        let current = self.diff.current_file(self.split_for(area.w));
+        let current = self.diff.current_file(split);
         let mut jump = None;
         ui.p.push_clip(list_r);
         for (fi, f) in self.diff.files.iter().enumerate() {
@@ -3461,10 +3494,10 @@ impl GitApp {
         }
         ui.p.pop_clip();
 
-        let bar = area.take_top(34.0);
+        // Same toolbar height as in the wide working copy, so the diff doesn't shift between them.
+        let bar = diff_r.take_top(if diff_area.is_some() { 44.0 } else { 34.0 });
         self.diff_toolbar(ui, bar);
-        let split = self.split_for(area.w);
-        if let Some(a) = self.diff.draw(ui, area, split, self.authors) {
+        if let Some(a) = self.diff.draw(ui, diff_r, split, self.authors) {
             self.apply_diff_action(a);
         }
         if let Some(fi) = jump {
@@ -5011,7 +5044,7 @@ mod tests {
         assert_eq!(h.app.wip_file, Some(("two".to_string(), false)));
         assert_eq!(h.app.diff.files[0].path, "two");
         // Each row's Stage button sits at the column's right edge.
-        let col_right = 1.0 + h.app.stage_col_w(1399.0);
+        let col_right = 1.0 + h.app.side_col_w(1399.0);
         h.click(col_right - 6.0 - 30.0, row(1));
         assert!(h.app.changes.iter().any(|c| c.path == "two" && c.staged() && !c.unstaged()));
         // Dragging the divider resizes the column.
@@ -5023,7 +5056,35 @@ mod tests {
         h.frame();
         h.ui.input.down = false;
         h.frame();
-        assert_eq!(h.app.stage_col_w(1399.0), 599.0);
+        assert_eq!(h.app.side_col_w(1399.0), 599.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wide_commit_view_lists_files_in_a_column_beside_the_diff() {
+        let dir = temp_repo("wide-commit");
+        let long: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.join("a.txt"), &long).unwrap();
+        std::fs::write(dir.join("b.txt"), &long).unwrap();
+        git::run(&dir, &["add", "."], None).unwrap();
+        git::run(&dir, &["commit", "-qm", "two files"], None).unwrap();
+        let mut h = Harness::new(&dir);
+        assert!(h.app.sel_row() == Some(0) && h.app.diff.files.len() == 2);
+        h.app.wide = true;
+        h.frame();
+        // Column: commit header (one subject line, no body), tabs, "2 FILES" header, then the rows.
+        // (Stacked, x = 100 would be in the sidebar.)
+        let row = |i: usize| TOP_H + 68.0 + 34.0 + 26.0 + i as f32 * 22.0 + 11.0;
+        h.click(100.0, row(1));
+        assert!(h.app.diff.scroll.target > 0.0, "clicking b.txt in the column scrolls the diff to it");
+        // The Files tab keeps the column: tree on the left, the opened file on the right.
+        h.app.act(Act::BrowseFiles);
+        h.frame();
+        // Same column: compact header (68), tabs (34), then the tree's rows (4px top margin).
+        let tree_row = |i: usize| TOP_H + 68.0 + 34.0 + 4.0 + i as f32 * 22.0 + 11.0;
+        h.click(100.0, tree_row(0));
+        assert_eq!(h.app.file_view.as_ref().map(|f| f.path.as_str()), Some("a.txt"));
+        assert_eq!(h.app.tree.selected.as_deref(), Some("a.txt"), "the tree highlights the open file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
