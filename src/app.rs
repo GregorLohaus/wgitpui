@@ -124,6 +124,8 @@ struct BDrag {
 enum Undo {
     /// A patch that was reverse-applied to the working tree.
     Patch { patch: String, label: String },
+    /// A patch that was reverse-applied to the index (discarded staged lines).
+    IndexPatch { patch: String, label: String },
     /// An untracked file that was deleted.
     Restore { path: String, data: Vec<u8>, label: String },
     /// HEAD moved (commit, amend, rebase); go back to `to`.
@@ -139,6 +141,7 @@ impl Undo {
     fn label(&self) -> &str {
         match self {
             Undo::Patch { label, .. }
+            | Undo::IndexPatch { label, .. }
             | Undo::Restore { label, .. }
             | Undo::Reset { label, .. }
             | Undo::Many(_, label)
@@ -524,7 +527,7 @@ impl GitApp {
             let mut save = |u: &Undo| {
                 n += 1;
                 match u {
-                    Undo::Patch { patch, .. } => {
+                    Undo::Patch { patch, .. } | Undo::IndexPatch { patch, .. } => {
                         let _ = std::fs::create_dir_all(&dir);
                         let _ = std::fs::write(dir.join(format!("{stamp}-{n}.patch")), patch);
                     }
@@ -554,6 +557,7 @@ impl GitApp {
     fn apply_undo(repo: &Repo, u: &Undo) -> Result<String, String> {
         match u {
             Undo::Patch { patch, .. } => repo.apply_worktree(patch, false),
+            Undo::IndexPatch { patch, .. } => repo.apply_cached(patch, false),
             Undo::Restore { path, data, .. } => {
                 let p = repo.root.join(path);
                 if let Some(parent) = p.parent() {
@@ -927,6 +931,7 @@ impl GitApp {
 
     fn replace_diff(old: &mut DiffView, mut view: DiffView) {
         if view.key == old.key {
+            view.keep_selection(old);
             view.scroll = std::mem::take(&mut old.scroll);
             view.hscroll = old.hscroll;
             if !old.collapsed.is_empty() {
@@ -1324,7 +1329,8 @@ impl GitApp {
                 }
                 let undo = self.branch_undo(dst.clone(), dst.as_ref().map(|_| prev), format!("merge {src}"));
                 let repo = self.repo.as_ref().unwrap();
-                let r = repo.git_env(&["merge", "--no-edit", &src], &[("GIT_EDITOR", "true")]);
+                // Always a merge commit, even when a fast-forward would do (that's its own action).
+                let r = repo.git_env(&["merge", "--no-ff", "--no-edit", &src], &[("GIT_EDITOR", "true")]);
                 let into = dst.unwrap_or_else(|| self.head_name.clone());
                 self.after_op(r, &format!("Merged {src} into {into}"), "Merge", undo);
             }
@@ -1411,6 +1417,63 @@ impl GitApp {
                 let r = repo.git(&["branch", "-D", &name]);
                 if self.result(r, "") {
                     self.push_undo(Undo::Cmd { args: vec!["branch".into(), name.clone(), hash], label: format!("delete branch {name}") });
+                }
+                self.reload_all(false);
+            }
+            Act::PromptUpstream(branch) => {
+                self.focus = Focus::Palette;
+                self.palette.reset("");
+                self.palette.upstream_for = Some(branch);
+            }
+            Act::SetUpstream { branch, upstream } => {
+                let before = repo.upstream_config(&branch);
+                let (r, label) = match &upstream {
+                    Some(u) => (repo.git(&["branch", &format!("--set-upstream-to={u}"), &branch]), format!("track {u} with {branch}")),
+                    None => (repo.git(&["branch", "--unset-upstream", &branch]), format!("stop tracking for {branch}")),
+                };
+                if self.result(r, "") {
+                    // Undo writes the old settings back as they were, even if their remote branch is gone.
+                    let undo = match before {
+                        Some((remote, merge)) => {
+                            let set = |key: &str, v: &str| Undo::Cmd { args: own(&["config", &format!("branch.{branch}.{key}"), v]), label: String::new() };
+                            Undo::Many(vec![set("remote", &remote), set("merge", &merge)], label)
+                        }
+                        None => Undo::Cmd { args: own(&["branch", "--unset-upstream", &branch]), label },
+                    };
+                    self.push_undo(undo);
+                }
+                self.reload_all(false);
+            }
+            Act::PromptTagAt(h) => {
+                self.focus = Focus::Palette;
+                self.palette.reset("");
+                self.palette.tag_at = Some(h);
+            }
+            Act::CreateTag { name, at, message, push } => {
+                let mut args = vec!["tag"];
+                if let Some(m) = &message {
+                    args.extend(["-a", "-m", m]);
+                }
+                args.extend([name.as_str(), at.as_str()]);
+                let r = repo.git(&args);
+                if self.result(r, "") {
+                    self.push_undo(Undo::Cmd { args: own(&["tag", "-d", &name]), label: format!("create tag {name}") });
+                    if let Some(remote) = push {
+                        self.act(Act::PushTag { tag: Some(name), remote });
+                    }
+                }
+                self.reload_all(false);
+            }
+            Act::PushTag { tag: Some(t), remote } => {
+                self.spawn(&format!("Pushing tag {t} to {remote}"), own(&["push", &remote, &format!("refs/tags/{t}")]));
+            }
+            Act::PushTag { tag: None, remote } => self.spawn(&format!("Pushing tags to {remote}"), own(&["push", &remote, "--tags"])),
+            Act::DeleteTag(name) => {
+                let Some(id) = repo.rev_parse(&format!("refs/tags/{name}")) else { return };
+                let r = repo.git(&["tag", "-d", &name]);
+                if self.result(r, "") {
+                    // An annotated tag's object outlives the ref: pointing the name back at it restores it.
+                    self.push_undo(Undo::Cmd { args: own(&["update-ref", &format!("refs/tags/{name}"), &id]), label: format!("delete tag {name}") });
                 }
                 self.reload_all(false);
             }
@@ -1598,30 +1661,53 @@ impl GitApp {
                 }
                 return;
             }
-            DiffAction::Hunk { f, h, lines_only } | DiffAction::Discard { f, h, lines_only } => {
-                let discard = matches!(a, DiffAction::Discard { .. });
-                let file = &self.diff.files[f];
-                let sel = &self.diff.selected;
-                let pick = |l: usize| sel.contains(&(f, h, l));
-                let filter: Option<&dyn Fn(usize) -> bool> = if lines_only { Some(&pick) } else { None };
-                // Unstaging and discarding both reverse-apply; see git::hunk_patch.
-                let reverse = discard || self.diff.mode == DiffMode::Staged;
-                let patch = git::hunk_patch(file, h, filter, reverse);
-                if discard {
-                    let what = if lines_only { format!("{} lines", self.diff.selected.len()) } else { "hunk".into() };
-                    let label = format!("discard {what} in {}", file.path);
-                    match repo.apply_worktree(&patch, true) {
-                        Ok(_) => self.push_undo(Undo::Patch { patch, label }),
-                        Err(e) => self.toast_err(e),
-                    }
-                } else {
-                    let r = repo.apply_cached(&patch, reverse);
-                    self.result(r, "");
-                }
+            DiffAction::Hunk { f, h, discard } => self.apply_lines(f, vec![h], false, discard),
+            DiffAction::Lines { f, discard } => {
+                let mut hunks: Vec<usize> = self.diff.selected.iter().filter(|s| s.0 == f).map(|s| s.1).collect();
+                hunks.sort_unstable();
+                hunks.dedup();
+                self.apply_lines(f, hunks, true, discard);
             }
         }
-        self.diff.selected.clear();
         self.reload_status();
+    }
+
+    /// Stages, unstages or discards (`discard`) some of file `f`'s hunks in the working-copy
+    /// diff: whole, or with `lines`, just their selected lines. Discarding staged changes takes
+    /// them out of the index and the working tree.
+    fn apply_lines(&mut self, f: usize, hunks: Vec<usize>, lines: bool, discard: bool) {
+        let Some(repo) = self.repo.as_ref().filter(|_| !hunks.is_empty()) else { return };
+        let sel = &self.diff.selected;
+        let pick = |h: usize, l: usize| sel.contains(&(f, h, l));
+        let filter: Option<&dyn Fn(usize, usize) -> bool> = if lines { Some(&pick) } else { None };
+        let file = &self.diff.files[f];
+        let n = sel.iter().filter(|s| s.0 == f).count();
+        let what = if lines { format!("{n} line{}", if n == 1 { "" } else { "s" }) } else { "hunk".into() };
+        let staged = self.diff.mode == DiffMode::Staged;
+        let same = |n: u32| n;
+        // Unstaging and discarding reverse-apply; see git::lines_patch.
+        let done = match (discard, staged) {
+            (false, _) => repo.apply_cached(&git::lines_patch(file, &hunks, filter, staged, &same), staged).map(|_| None),
+            (true, false) => {
+                let patch = git::lines_patch(file, &hunks, filter, true, &same);
+                let label = format!("discard {what} in {}", file.path);
+                repo.apply_worktree(&patch, true).map(|_| Some(Undo::Patch { patch, label }))
+            }
+            (true, true) => repo.discard_staged(file, &hunks, filter).map(|(index, worktree)| {
+                let steps = vec![Undo::IndexPatch { patch: index, label: String::new() }, Undo::Patch { patch: worktree, label: String::new() }];
+                Some(Undo::Many(steps, format!("discard staged {what} in {}", file.path)))
+            }),
+        };
+        match done {
+            Ok(undo) => {
+                // Those lines are dealt with; a selection elsewhere carries over to the new diff.
+                self.diff.selected.retain(|s| s.0 != f || !hunks.contains(&s.1));
+                if let Some(u) = undo {
+                    self.push_undo(u);
+                }
+            }
+            Err(e) => self.toast_err(e),
+        }
     }
 
     // ---- interactive rebase -----------------------------------------------------------------
@@ -2310,6 +2396,10 @@ impl GitApp {
                 }
                 if rf.behind > 0 {
                     track.push_str(&format!(" ↓{}", rf.behind));
+                }
+                if rf.gone {
+                    // What it tracked was deleted on the remote (right-click → Change upstream).
+                    track.push_str("gone");
                 }
                 let track = track.trim().to_string();
                 let tw = if track.is_empty() { 0.0 } else { (ui.p.measure(UI, 10.5, &track) + 8.0).min(row.w * 0.45) };
@@ -3825,6 +3915,14 @@ impl GitApp {
             self.palette.items = self.worktree_prompt_items(&from, &q);
             return;
         }
+        if let Some(at) = self.palette.tag_at.clone() {
+            self.palette.items = self.tag_prompt_items(&at, &q);
+            return;
+        }
+        if let Some(branch) = self.palette.upstream_for.clone() {
+            self.palette.items = self.upstream_prompt_items(&branch, &q);
+            return;
+        }
         let mut create: Option<Item> = None;
         let mut push = |label: String, detail: String, act: Act, kind: &'static str, extra: &str, boost: i32| {
             let hay = if extra.is_empty() { label.clone() } else { format!("{label} {extra}") };
@@ -3880,7 +3978,12 @@ impl GitApp {
                 actions.push(("Abort operation", format!("{} --abort", op.name().to_lowercase()), Act::OpAbort));
             }
             if let Some(h) = self.sel_row().map(|i| self.commits[i].hash.clone()).or_else(|| self.repo.as_ref()?.rev_parse("HEAD")) {
-                actions.push(("New branch…", "from the selected commit · or just type a name".into(), Act::PromptBranchAt(h)));
+                actions.push(("New branch…", "from the selected commit · or just type a name".into(), Act::PromptBranchAt(h.clone())));
+                actions.push(("New tag…", "on the selected commit · or HEAD".into(), Act::PromptTagAt(h)));
+            }
+            if let Some(it) = self.refs.iter().find(|r| r.kind == RefKind::Local && r.is_head).and_then(|r| self.upstream_item(r)) {
+                let label = if it.label.starts_with("Change") { "Change upstream of current branch…" } else { "Set upstream of current branch…" };
+                actions.push((label, it.detail, it.act.unwrap()));
             }
             if crate::cli::app_bundle().is_some() && !crate::cli::command_installed() {
                 actions.push(("Install 'wgitpui' command", "open repos from the terminal".into(), Act::InstallCli));
@@ -3893,13 +3996,16 @@ impl GitApp {
                 actions.extend([
                     ("Cherry-pick selected commit", format!("onto {head}"), Act::CherryPick(h.clone())),
                     ("Revert selected commit", "new commit undoing it".into(), Act::Revert(h.clone())),
-                    ("Merge selected commit", format!("into {head}"), Act::MergeInto { src: h.clone(), dst: None }),
+                    ("Merge selected commit", format!("into {head} · merge commit"), Act::MergeInto { src: h.clone(), dst: None }),
                     ("Rebase onto selected commit", format!("moves {head}"), Act::RebaseOnto { branch: None, onto: h.clone() }),
                     ("Reset to selected commit (soft)", "keep changes staged".into(), Act::Reset(h.clone(), "soft")),
                     ("Reset to selected commit (mixed)", "keep changes unstaged".into(), Act::Reset(h.clone(), "mixed")),
                     ("Reset to selected commit (hard)", "discard changes · undoable".into(), Act::Reset(h.clone(), "hard")),
-                    ("Create branch at selected commit…", "name it next".into(), Act::PromptBranchAt(h)),
+                    ("Create branch at selected commit…", "name it next".into(), Act::PromptBranchAt(h.clone())),
                 ]);
+                if self.repo.as_ref().is_some_and(|r| r.is_ancestor("HEAD", &h)) {
+                    actions.push(("Fast-forward to selected commit", format!("moves {head} · no merge commit"), Act::FastForward { src: h, dst: None }));
+                }
             }
             for (l, d, a) in actions {
                 push(l.into(), d, a, "action", "", 30);
@@ -3920,9 +4026,17 @@ impl GitApp {
             }
             let (remotes, upstream) = self.remotes_upstream_first();
             let head = self.head_name.clone();
+            let tags: Vec<&str> = self.refs.iter().filter(|r| r.kind == RefKind::Tag).map(|r| r.name.as_str()).collect();
             for (name, url) in remotes {
                 let rbranch = upstream.as_ref().filter(|(r, _)| *r == name).map_or_else(|| head.clone(), |(_, b)| b.clone());
                 push(format!("Push {head} to {name}"), short_url(&url), Act::PushTo { remote: name.clone(), force: false }, "action", "", 25);
+                if !tags.is_empty() {
+                    push(format!("Push all tags to {name}"), "git push --tags".into(), Act::PushTag { tag: None, remote: name.clone() }, "tag", "", 20);
+                }
+                for t in &tags {
+                    let act = Act::PushTag { tag: Some(t.to_string()), remote: name.clone() };
+                    push(format!("Push tag {t} to {name}"), short_url(&url), act, "tag", "", 0);
+                }
                 push(
                     format!("Pull {name}/{rbranch} into {head}"),
                     "fast-forward only".into(),
@@ -3942,7 +4056,7 @@ impl GitApp {
                 }
                 push(
                     format!("Merge {} into {}", rf.name, self.head_name),
-                    "git merge".into(),
+                    "merge commit".into(),
                     Act::MergeInto { src: rf.name.clone(), dst: None },
                     "merge",
                     "",
@@ -4026,6 +4140,56 @@ impl GitApp {
             items.insert(strong.min(items.len()), c);
         }
         self.palette.items = items;
+    }
+
+    /// The new-tag prompt: a name, then optionally a message, which makes it an annotated tag.
+    fn tag_prompt_items(&self, at: &str, q: &str) -> Vec<Item> {
+        let (name, message) = match q.split_once(char::is_whitespace) {
+            Some((n, m)) => (n, Some(m.trim().to_string()).filter(|m| !m.is_empty())),
+            None => (q, None),
+        };
+        if !valid_ref_name(name) {
+            return vec![];
+        }
+        if let Some(t) = self.refs.iter().find(|r| r.kind == RefKind::Tag && r.name == name) {
+            let act = self.hash_index.get(&t.target).map_or(Act::PromptTagAt(at.to_string()), |&i| Act::SelectCommit(i));
+            return vec![Item { label: format!("A tag named '{name}' already exists"), detail: "pick another name".into(), act, score: 0, kind: "tag" }];
+        }
+        let short = &at[..8.min(at.len())];
+        let detail = match &message {
+            Some(m) => format!("annotated · {m}"),
+            None => "lightweight · add a message to annotate it".into(),
+        };
+        let create = |push: Option<String>| Act::CreateTag { name: name.to_string(), at: at.to_string(), message: message.clone(), push };
+        let mut items = vec![Item { label: format!("Create tag '{name}' at {short}"), detail: detail.clone(), act: create(None), score: 1, kind: "tag" }];
+        if let Some((remote, _)) = self.remotes_upstream_first().0.into_iter().next() {
+            let label = format!("Create tag '{name}' at {short} and push it to {remote}");
+            items.push(Item { label, detail, act: create(Some(remote)), score: 0, kind: "tag" });
+        }
+        items
+    }
+
+    /// The upstream picker: every remote branch (ones with the same name first), and stopping
+    /// tracking altogether.
+    fn upstream_prompt_items(&self, branch: &str, q: &str) -> Vec<Item> {
+        let current = self.refs.iter().find(|r| r.kind == RefKind::Local && r.name == branch).map(|r| r.upstream.clone()).unwrap_or_default();
+        let mut items = Vec::new();
+        if !current.is_empty() {
+            let label = format!("Stop tracking {current}");
+            if let Some(score) = fuzzy(q, &label) {
+                let act = Act::SetUpstream { branch: branch.to_string(), upstream: None };
+                items.push(Item { label, detail: "git branch --unset-upstream".into(), act, score, kind: "action" });
+            }
+        }
+        for rf in self.refs.iter().filter(|r| r.kind == RefKind::Remote) {
+            let Some(score) = fuzzy(q, &rf.name) else { continue };
+            let same = rf.name.split_once('/').is_some_and(|(_, b)| b == branch);
+            let (detail, boost) = if rf.name == current { ("tracked now", -50) } else if same { ("same name", 20) } else { ("", 0) };
+            let act = Act::SetUpstream { branch: branch.to_string(), upstream: Some(rf.name.clone()) };
+            items.push(Item { label: format!("Track {}", rf.name), detail: detail.into(), act, score: score + boost, kind: "remote" });
+        }
+        items.sort_by(|a, b| b.score.cmp(&a.score));
+        items
     }
 
     /// The new-worktree prompt: type a new branch name (the folder goes next to the main
@@ -4125,6 +4289,8 @@ impl GitApp {
         let placeholder = match &self.palette.worktree_from {
             Some(f) => format!("New worktree from {}: a new branch name, or a path…", f.label),
             None if self.palette.branch_at.is_some() => "New branch name…".into(),
+            None if self.palette.tag_at.is_some() => "Tag name, then a message to make it an annotated tag…".into(),
+            None if self.palette.upstream_for.is_some() => format!("Remote branch for {} to track…", self.palette.upstream_for.as_deref().unwrap_or("")),
             None => "Type a command, branch, commit, or a path to open…".into(),
         };
         self.palette.input.draw(ui, input_r, &placeholder, true, false);
@@ -4157,6 +4323,7 @@ impl GitApp {
                 "branch" => theme::ACCENT,
                 "remote" => theme::CYAN,
                 "commit" => theme::DIM,
+                "tag" => theme::YELLOW,
                 _ => theme::GREEN,
             };
             let kw = ui.p.measure(UI, 10.0, item.kind) + 12.0;
@@ -4257,7 +4424,8 @@ impl GitApp {
                     }
                     None => "new branch".to_string(),
                 };
-                let label = if Some(name) == up_remote.as_ref() { format!("{name}  (upstream)") } else { name.clone() };
+                // Pushes go to the same name; an upstream with another name isn't the target.
+                let label = if upstream.as_deref() == Some(rb.as_str()) { format!("{name}  (upstream)") } else { name.clone() };
                 let mut it = item(label, Act::PushTo { remote: name.clone(), force: false });
                 it.detail = format!("{state}  ·  {}", short_url(url));
                 items.push(it);
@@ -4269,12 +4437,25 @@ impl GitApp {
                 items.push(it);
             }
         }
+        if self.refs.iter().any(|r| r.kind == RefKind::Tag) {
+            if !items.is_empty() {
+                items.push(sep());
+            }
+            for (name, _) in &remotes {
+                let mut it = item(format!("Push all tags to {name}"), Act::PushTag { tag: None, remote: name.clone() });
+                it.detail = "git push --tags".into();
+                items.push(it);
+            }
+        }
+        let other_name = upstream.as_ref().filter(|u| !remotes.iter().any(|(n, _)| **u == format!("{n}/{branch}")));
         let note = if detached {
             Some(("Detached HEAD — check out a branch to push".to_string(), theme::ORANGE))
         } else if let Some(r) = &diverged {
             Some((format!("{branch} and {r}/{branch} have diverged — pull first, or force push"), theme::ORANGE))
         } else if upstream.is_none() {
             Some(("No upstream yet — the remote you pick becomes the upstream".to_string(), theme::DIM))
+        } else if let Some(u) = other_name {
+            Some((format!("{branch} tracks {u}, but pushes go to a branch named {branch}"), theme::DIM))
         } else {
             None
         };
@@ -4432,14 +4613,16 @@ impl GitApp {
         };
         let mut items = vec![
             item("Create branch here…", Act::PromptBranchAt(hash.clone())),
+            item("Create tag here…", Act::PromptTagAt(hash.clone())),
             item("Check out this commit (detached)", Act::CheckoutDetached(hash.clone())),
             item("New worktree here…", Act::NewWorktree(from)),
             sep(),
         ];
         let note = if is_head { None } else { self.preview_note("HEAD", &hash, &short) };
         if !is_head {
+            let head_hash = self.head_row.map_or_else(|| "HEAD".to_string(), |i| self.commits[i].hash.clone());
+            items.extend(self.merge_items((&hash, "this commit", &hash), (None, &head, &head_hash)));
             items.extend([
-                item(format!("Merge into {head}"), Act::MergeInto { src: hash.clone(), dst: None }),
                 item(format!("Rebase {head} onto this"), Act::RebaseOnto { branch: None, onto: hash.clone() }),
                 item(format!("Cherry-pick onto {head}"), Act::CherryPick(hash.clone())),
             ]);
@@ -4492,14 +4675,16 @@ impl GitApp {
         let mut note = None;
         if !rf.is_head {
             note = self.preview_note("HEAD", &rf.target, &rf.name);
-            items.push(item(format!("Merge {} into {head}", rf.name), Act::MergeInto { src: rf.name.clone(), dst: None }));
+            let head_hash = self.head_row.map_or_else(|| "HEAD".to_string(), |i| self.commits[i].hash.clone());
+            items.extend(self.merge_items((&rf.name, &rf.name, &rf.target), (None, &head, &head_hash)));
             items.push(item(format!("Rebase {head} onto {}", rf.name), Act::RebaseOnto { branch: None, onto: rf.name.clone() }));
-            if self.repo.as_ref().is_some_and(|r| r.is_ancestor("HEAD", &rf.target)) {
-                items.push(item(format!("Fast-forward {head} to {}", rf.name), Act::FastForward { src: rf.name.clone(), dst: None }));
-            }
             items.push(item(format!("Compare {head} ↔ {}", rf.name), Act::CompareRef(rf.target.clone(), rf.name.clone())));
         }
         items.push(item("Create branch from here…", Act::PromptBranchAt(rf.target.clone())));
+        items.push(item("Create tag here…", Act::PromptTagAt(rf.target.clone())));
+        if rf.kind == RefKind::Local {
+            items.extend(self.upstream_item(&rf));
+        }
         if rf.kind != RefKind::Tag {
             let full = ref_full(&rf);
             if self.hidden.contains(&full) {
@@ -4510,11 +4695,53 @@ impl GitApp {
                 items.push(it);
             }
         }
+        if rf.kind == RefKind::Tag {
+            items.push(sep());
+            for (remote, url) in self.repo.as_ref().map(|r| r.remotes()).unwrap_or_default() {
+                let mut it = item(format!("Push tag to {remote}"), Act::PushTag { tag: Some(rf.name.clone()), remote });
+                it.detail = short_url(&url);
+                items.push(it);
+            }
+            let mut it = danger(format!("Delete tag {}", rf.name), Act::DeleteTag(rf.name.clone()));
+            it.detail = "here, not on remotes · undoable".into();
+            items.push(it);
+        }
         if rf.kind == RefKind::Local && !rf.is_head && self.branch_worktree(&rf.name).is_none() {
             items.push(sep());
             items.push(danger(format!("Delete branch {}", rf.name), Act::DeleteBranch(rf.name.clone())));
         }
         self.menu = Some(Menu { at, title: rf.name.clone(), note, items, fresh: true });
+    }
+
+    /// "Merge src into dst", which always makes a merge commit, and when dst is behind src (a
+    /// straight line from it), "Fast-forward dst to src" as the alternative. Each side is
+    /// (name to act on, label, commit); dst's name is None for HEAD.
+    fn merge_items(&self, (src, src_label, src_hash): (&str, &str, &str), (dst, dst_label, dst_hash): (Option<&str>, &str, &str)) -> Vec<MenuItem> {
+        let dst = dst.map(String::from);
+        let mut merge = item(format!("Merge {src_label} into {dst_label}"), Act::MergeInto { src: src.to_string(), dst: dst.clone() });
+        merge.detail = "merge commit".into();
+        let mut items = vec![merge];
+        if src_hash != dst_hash && self.repo.as_ref().is_some_and(|r| r.is_ancestor(dst_hash, src_hash)) {
+            let mut ff = item(format!("Fast-forward {dst_label} to {src_label}"), Act::FastForward { src: src.to_string(), dst });
+            ff.detail = "no merge commit".into();
+            items.push(ff);
+        }
+        items
+    }
+
+    /// "Set upstream…" / "Change upstream…" for a local branch, when there's one to change or
+    /// remote branches to pick from.
+    fn upstream_item(&self, rf: &Ref) -> Option<MenuItem> {
+        let (label, detail) = if !rf.upstream.is_empty() {
+            ("Change upstream…", if rf.gone { format!("{} · gone", rf.upstream) } else { format!("tracks {}", rf.upstream) })
+        } else if self.refs.iter().any(|r| r.kind == RefKind::Remote) {
+            ("Set upstream…", "none yet".to_string())
+        } else {
+            return None;
+        };
+        let mut it = item(label, Act::PromptUpstream(rf.name.clone()));
+        it.detail = detail;
+        Some(it)
     }
 
     /// Menu shown when one branch label is dropped onto another.
@@ -4523,10 +4750,7 @@ impl GitApp {
         let mut items = Vec::new();
         let opt = |r: &Ref| if r.is_head { None } else { Some(r.name.clone()) };
         if d.kind == RefKind::Local {
-            items.push(item(format!("Merge {src} into {dst}"), Act::MergeInto { src: src.to_string(), dst: opt(&d) }));
-            if self.repo.as_ref().is_some_and(|r| r.is_ancestor(&d.target, &s.target)) {
-                items.push(item(format!("Fast-forward {dst} to {src}"), Act::FastForward { src: src.to_string(), dst: opt(&d) }));
-            }
+            items.extend(self.merge_items((src, src, &s.target), (opt(&d).as_deref(), dst, &d.target)));
         }
         if s.kind == RefKind::Local {
             items.push(item(format!("Rebase {src} onto {dst}"), Act::RebaseOnto { branch: opt(&s), onto: dst.to_string() }));
@@ -4899,6 +5123,17 @@ fn added_worktrees(u: &Undo) -> Vec<PathBuf> {
     }
 }
 
+/// Whether git takes `name` for a tag or branch (the rules of `git check-ref-format`).
+fn valid_ref_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "@"
+        && !name.starts_with(['-', '.', '/'])
+        && !name.ends_with(['.', '/'])
+        && !name.ends_with(".lock")
+        && !["..", "@{", "//", "/."].iter().any(|s| name.contains(s))
+        && !name.chars().any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c))
+}
+
 /// A branch's name without its remote (`origin/main` → `main`).
 fn branch_short(r: &Ref) -> &str {
     match r.kind {
@@ -5229,7 +5464,7 @@ mod tests {
 
         // Stage "y" and "z" from the untracked file.
         h.app.diff.selected.extend([(0, 0, 1), (0, 0, 2)]);
-        h.app.apply_diff_action(DiffAction::Hunk { f: 0, h: 0, lines_only: true });
+        h.app.apply_diff_action(DiffAction::Lines { f: 0, discard: false });
         assert!(h.app.toast.as_ref().is_none_or(|t| !t.err), "{:?}", h.app.toast.as_ref().map(|t| &t.msg));
         assert_eq!(show(&h).unwrap(), "y\nz\n");
 
@@ -5239,10 +5474,79 @@ mod tests {
         assert!(h.app.diff.mode == DiffMode::Staged);
         let y = h.app.diff.files[0].hunks[0].lines.iter().position(|l| l == "+y").unwrap();
         h.app.diff.selected.insert((0, 0, y));
-        h.app.apply_diff_action(DiffAction::Hunk { f: 0, h: 0, lines_only: true });
+        h.app.apply_diff_action(DiffAction::Lines { f: 0, discard: false });
         assert!(h.app.toast.as_ref().is_none_or(|t| !t.err), "{:?}", h.app.toast.as_ref().map(|t| &t.msg));
         assert_eq!(show(&h).unwrap(), "z\n");
         let _ = git::run(&dir, &["worktree", "remove", "--force", wt.to_str().unwrap()], None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn selected_lines_across_hunks_stage_together_and_other_selections_stay() {
+        let dir = temp_repo("multi-hunk");
+        let body: Vec<String> = (1..=40).map(|i| format!("line {i}")).collect();
+        let write = |v: &[String]| std::fs::write(dir.join("m"), v.join("\n") + "\n").unwrap();
+        write(&body);
+        git::run(&dir, &["add", "."], None).unwrap();
+        git::run(&dir, &["commit", "-qm", "m"], None).unwrap();
+        let mut edited = body.clone();
+        for i in [1, 12, 23, 34] {
+            edited[i] = format!("line {} changed", i + 1);
+        }
+        write(&edited);
+        let mut h = Harness::new(&dir);
+        assert_eq!(h.app.wip_file, Some(("m".to_string(), false)));
+        assert_eq!(h.app.diff.files[0].hunks.len(), 4);
+        let at = |h: &Harness, hunk: usize, text: &str| (0, hunk, h.app.diff.files[0].hunks[hunk].lines.iter().position(|l| l == text).unwrap());
+        let index = |h: &Harness| h.app.repo.as_ref().unwrap().git(&["show", ":m"]).unwrap();
+
+        // A selection over two hunks goes in with one click.
+        let picks = [at(&h, 0, "-line 2"), at(&h, 0, "+line 2 changed"), at(&h, 1, "-line 13"), at(&h, 1, "+line 13 changed")];
+        h.app.diff.selected.extend(picks);
+        h.app.apply_diff_action(DiffAction::Lines { f: 0, discard: false });
+        assert!(h.app.toast.as_ref().is_none_or(|t| !t.err), "{:?}", h.app.toast.as_ref().map(|t| &t.msg));
+        let mut want = body.clone();
+        want[1] = "line 2 changed".into();
+        want[12] = "line 13 changed".into();
+        assert_eq!(index(&h), want.join("\n") + "\n");
+        assert!(h.app.diff.selected.is_empty());
+
+        // Staging one hunk keeps the lines selected in another, and so does a refresh.
+        assert_eq!(h.app.diff.files[0].hunks.len(), 2);
+        let keep = at(&h, 1, "+line 35 changed");
+        h.app.diff.selected.insert(keep);
+        h.app.apply_diff_action(DiffAction::Hunk { f: 0, h: 0, discard: false });
+        assert_eq!(h.app.diff.files[0].hunks.len(), 1);
+        assert_eq!(h.app.diff.selected, HashSet::from([at(&h, 0, "+line 35 changed")]));
+        h.app.on_focus();
+        assert_eq!(h.app.diff.selected.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discard_staged_lines_with_undo() {
+        let dir = temp_repo("discard-staged-app");
+        std::fs::write(dir.join("s"), "a\nb\nc\n").unwrap();
+        git::run(&dir, &["add", "."], None).unwrap();
+        git::run(&dir, &["commit", "-qm", "s"], None).unwrap();
+        std::fs::write(dir.join("s"), "a\nB\nc\nd\n").unwrap();
+        git::run(&dir, &["add", "."], None).unwrap();
+        let mut h = Harness::new(&dir);
+        h.app.wip_file = Some(("s".into(), true));
+        h.app.load_wip_diff();
+        assert!(h.app.diff.mode == DiffMode::Staged);
+        let show = |h: &Harness| h.app.repo.as_ref().unwrap().git(&["show", ":s"]).unwrap();
+        let read = || std::fs::read_to_string(dir.join("s")).unwrap();
+
+        // Discard the staged "b → B": gone from the index and from the file; "d" stays staged.
+        let lines = &h.app.diff.files[0].hunks[0].lines;
+        let pick: Vec<usize> = ["-b", "+B"].iter().map(|t| lines.iter().position(|l| l == t).unwrap()).collect();
+        h.app.diff.selected.extend(pick.iter().map(|&l| (0, 0, l)));
+        h.app.apply_diff_action(DiffAction::Lines { f: 0, discard: true });
+        assert!(h.app.toast.as_ref().is_some_and(|t| !t.err && t.undo), "{:?}", h.app.toast.as_ref().map(|t| &t.msg));
+        assert_eq!((show(&h).as_str(), read().as_str()), ("a\nb\nc\nd\n", "a\nb\nc\nd\n"));
+        h.app.undo();
+        assert_eq!((show(&h).as_str(), read().as_str()), ("a\nB\nc\nd\n", "a\nB\nc\nd\n"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5359,6 +5663,169 @@ mod tests {
         assert_eq!(repo.last_message(), "mine");
         assert!(repo.is_ancestor("origin/main", "HEAD"));
         for d in [&dir, &up, &other] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn merges_make_a_merge_commit_and_fast_forward_is_the_alternative() {
+        let dir = temp_repo("merge-ff");
+        let git = |args: &[&str]| git::run(&dir, args, None).unwrap();
+        git(&["switch", "-q", "-c", "feature"]);
+        std::fs::write(dir.join("three"), "3").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "three"]);
+        git(&["switch", "-q", "main"]);
+        let mut h = Harness::new(&dir);
+        let parents = || git(&["log", "-1", "--format=%P"]).split_whitespace().count();
+        let subject = || git(&["log", "-1", "--format=%s"]).trim().to_string();
+
+        // main could fast-forward to feature: both are offered, the merge commit first.
+        h.app.open_branch_menu("feature", (400.0, 150.0));
+        h.frame();
+        let items = &h.app.menu.as_ref().unwrap().items;
+        let at = items.iter().position(|i| i.label == "Merge feature into main").unwrap();
+        assert_eq!((items[at].detail.as_str(), items[at + 1].label.as_str()), ("merge commit", "Fast-forward main to feature"));
+        h.click_menu_item("Merge feature into main");
+        assert_eq!((parents(), subject()), (2, "Merge branch 'feature'".to_string()));
+
+        // Undo, then take the fast-forward instead.
+        h.app.undo();
+        assert_eq!(subject(), "two");
+        h.app.open_branch_menu("feature", (400.0, 150.0));
+        h.frame();
+        h.click_menu_item("Fast-forward main to feature");
+        assert_eq!((parents(), subject()), (1, "three".to_string()));
+
+        // A commit's menu offers both too, as long as HEAD is behind it.
+        git(&["reset", "-q", "--hard", "HEAD~1"]);
+        h.app.reload_all(false);
+        let row = h.app.commits.iter().position(|c| c.subject == "three").unwrap();
+        h.app.open_commit_menu(row, (400.0, 150.0));
+        let labels = h.menu_labels();
+        assert!(labels.contains(&"Merge this commit into main".to_string()) && labels.contains(&"Fast-forward main to this commit".to_string()), "{labels:?}");
+        // Once main has moved on, there's no fast-forward left to offer.
+        std::fs::write(dir.join("four"), "4").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "four"]);
+        h.app.reload_all(false);
+        h.app.open_branch_menu("feature", (400.0, 150.0));
+        assert!(!h.menu_labels().iter().any(|l| l.starts_with("Fast-forward")), "{:?}", h.menu_labels());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tags_are_created_pushed_and_deleted() {
+        let dir = temp_repo("tags");
+        let up = dir.with_file_name(format!("{}-up.git", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&up);
+        git::run(&dir, &["init", "-q", "--bare", up.to_str().unwrap()], None).unwrap();
+        git::run(&dir, &["remote", "add", "origin", up.to_str().unwrap()], None).unwrap();
+        let git = |args: &[&str]| git::run(&dir, args, None);
+        let remote_has = |tag: &str| git::run(&up, &["cat-file", "-t", &format!("refs/tags/{tag}")], None).map(|t| t.trim().to_string());
+        let mut h = Harness::new(&dir);
+        let head = git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let labels = |h: &Harness| h.app.palette.items.iter().map(|i| i.label.clone()).collect::<Vec<_>>();
+
+        // Just a name: a lightweight tag, here or here and on origin.
+        h.app.act(Act::PromptTagAt(head.clone()));
+        h.type_text("v1");
+        let short = &head[..8];
+        assert_eq!(labels(&h), [format!("Create tag 'v1' at {short}"), format!("Create tag 'v1' at {short} and push it to origin")]);
+        assert!(h.app.palette.items[0].detail.starts_with("lightweight"));
+        h.key(Key::Enter);
+        assert_eq!(git(&["cat-file", "-t", "v1"]).unwrap().trim(), "commit");
+        assert!(h.app.refs.iter().any(|r| r.kind == RefKind::Tag && r.name == "v1"));
+        h.app.undo();
+        assert!(git(&["rev-parse", "-q", "--verify", "refs/tags/v1"]).is_err());
+
+        // A message makes it annotated; the second item also pushes it.
+        h.app.act(Act::PromptTagAt(head.clone()));
+        h.type_text("v2 First release");
+        assert_eq!(h.app.palette.items[1].detail, "annotated · First release");
+        h.key(Key::Down);
+        h.key(Key::Enter);
+        h.wait_job();
+        assert_eq!(remote_has("v2").unwrap(), "tag");
+        // Taken names and names git refuses get nothing to click.
+        for (name, n) in [("v2", 1), ("-x", 0), ("a..b", 0), ("x.lock", 0)] {
+            h.app.act(Act::PromptTagAt(head.clone()));
+            h.type_text(name);
+            assert_eq!(h.app.palette.items.len(), n, "{name}: {:?}", labels(&h));
+        }
+        assert_eq!(labels(&h).len(), 0);
+        h.app.focus = Focus::None;
+
+        // Deleting is local and undoable; the annotation comes back with it.
+        h.app.open_branch_menu("v2", (400.0, 150.0));
+        let menu = h.menu_labels();
+        assert!(menu.contains(&"Push tag to origin".to_string()) && menu.contains(&"Delete tag v2".to_string()), "{menu:?}");
+        h.app.act(Act::DeleteTag("v2".into()));
+        assert!(git(&["rev-parse", "-q", "--verify", "refs/tags/v2"]).is_err());
+        h.app.undo();
+        assert_eq!(git(&["tag", "-l", "--format=%(objecttype) %(contents:subject)", "v2"]).unwrap().trim(), "tag First release");
+
+        // Push all tags from the Push menu.
+        h.app.act(Act::CreateTag { name: "v3".into(), at: head.clone(), message: None, push: None });
+        h.app.open_push_menu((900.0, 60.0));
+        h.frame();
+        h.click_menu_item("Push all tags to origin");
+        h.wait_job();
+        assert_eq!(remote_has("v3").unwrap(), "commit");
+        for d in [&dir, &up] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn upstream_can_be_changed_and_dropped() {
+        let dir = temp_repo("upstream");
+        let up = dir.with_file_name(format!("{}-up.git", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&up);
+        let git = |args: &[&str]| git::run(&dir, args, None).unwrap();
+        git(&["init", "-q", "--bare", up.to_str().unwrap()]);
+        git(&["remote", "add", "origin", up.to_str().unwrap()]);
+        git(&["push", "-q", "-u", "origin", "main"]);
+        git(&["push", "-q", "origin", "main:other"]);
+        let mut h = Harness::new(&dir);
+        let main = |h: &Harness| h.app.refs.iter().find(|r| r.kind == RefKind::Local && r.name == "main").cloned().unwrap();
+        let labels = |h: &Harness| h.app.palette.items.iter().map(|i| i.label.clone()).collect::<Vec<_>>();
+        assert_eq!(main(&h).upstream, "origin/main");
+
+        // Branch menu → picker → another remote branch.
+        h.app.open_branch_menu("main", (400.0, 150.0));
+        h.frame();
+        let it = h.app.menu.as_ref().unwrap().items.iter().find(|i| i.label == "Change upstream…").unwrap();
+        assert_eq!(it.detail, "tracks origin/main");
+        h.click_menu_item("Change upstream…");
+        assert_eq!(h.app.palette.upstream_for.as_deref(), Some("main"));
+        h.frame();
+        assert_eq!(labels(&h), ["Stop tracking origin/main", "Track origin/other", "Track origin/main"]);
+        h.type_text("other");
+        assert_eq!(labels(&h), ["Track origin/other"]);
+        h.key(Key::Enter);
+        assert_eq!(main(&h).upstream, "origin/other");
+        h.app.undo();
+        assert_eq!(main(&h).upstream, "origin/main");
+
+        // The tracked branch is deleted on the remote: "gone", and the same name comes first.
+        h.app.act(Act::SetUpstream { branch: "main".into(), upstream: Some("origin/other".into()) });
+        git(&["push", "-q", "origin", "--delete", "other"]);
+        h.app.reload_all(false);
+        assert!(main(&h).gone);
+        h.app.open_branch_menu("main", (400.0, 150.0));
+        let it = h.app.menu.as_ref().unwrap().items.iter().find(|i| i.label == "Change upstream…").unwrap();
+        assert_eq!(it.detail, "origin/other · gone");
+        h.app.act(Act::PromptUpstream("main".into()));
+        h.frame();
+        assert_eq!(labels(&h), ["Track origin/main", "Stop tracking origin/other"]);
+        h.app.focus = Focus::None;
+        // Stop tracking; undo brings even a gone upstream back.
+        h.app.act(Act::SetUpstream { branch: "main".into(), upstream: None });
+        assert_eq!(main(&h).upstream, "");
+        h.app.undo();
+        assert_eq!((main(&h).upstream.as_str(), main(&h).gone), ("origin/other", true));
+        for d in [&dir, &up] {
             let _ = std::fs::remove_dir_all(d);
         }
     }

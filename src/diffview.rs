@@ -3,7 +3,7 @@
 
 use crate::font::{MONO, UI};
 use crate::attr;
-use crate::git::{self, Blame, BlameCommit, FileDiff, Side};
+use crate::git::{self, Blame, BlameCommit, FileDiff, Hunk, Side};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use crate::syntax::{self, Lang, Tok};
@@ -36,10 +36,11 @@ pub enum DRow {
 }
 
 pub enum DiffAction {
-    /// Move the whole hunk (or only its selected lines) into / out of the index.
-    Hunk { f: usize, h: usize, lines_only: bool },
-    /// Revert the hunk (or selected lines) in the working tree.
-    Discard { f: usize, h: usize, lines_only: bool },
+    /// Move a whole hunk into / out of the index, or with `discard`, revert it (for a staged
+    /// hunk: in the index and the working tree).
+    Hunk { f: usize, h: usize, discard: bool },
+    /// The same for the selected lines of file `f`, in all of its hunks.
+    Lines { f: usize, discard: bool },
     StageFile(String),
     DeleteUntracked(String),
     Blame(String),
@@ -57,6 +58,17 @@ pub struct BlameSrc {
 enum Slot {
     Pending(mpsc::Receiver<Option<Blame>>),
     Ready(Option<Blame>),
+}
+
+/// A press on a `+`/`-` line, dragged.
+#[derive(Clone, Copy)]
+struct Drag {
+    /// Whether the lines it passes get selected (or unselected).
+    on: bool,
+    /// Split view: the side it started on.
+    side: usize,
+    /// The last row it reached.
+    row: usize,
 }
 
 /// How a file changed, derived from the diff header.
@@ -98,7 +110,7 @@ pub struct DiffView {
     pub scroll: Scroll,
     pub hscroll: f32,
     pub selected: HashSet<(usize, usize, usize)>,
-    drag: Option<bool>,
+    drag: Option<Drag>,
     first_row: usize,
     notes: Vec<String>,
     spans: Vec<(usize, usize, Tok)>,
@@ -429,6 +441,30 @@ impl DiffView {
         self.selected.iter().filter(|s| s.0 == f && s.1 == h).count()
     }
 
+    fn selected_in_file(&self, f: usize) -> usize {
+        self.selected.iter().filter(|s| s.0 == f).count()
+    }
+
+    /// Carries the line selection over from `old`, the same diff loaded again (after staging
+    /// another hunk, a refresh on focus, …), onto every hunk that is still there unchanged.
+    pub fn keep_selection(&mut self, old: &DiffView) {
+        let mut by_hunk: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+        for &(f, h, l) in &old.selected {
+            by_hunk.entry((f, h)).or_default().push(l);
+        }
+        for ((f, h), lines) in by_hunk {
+            let Some((path, was)) = old.files.get(f).and_then(|x| Some((&x.path, x.hunks.get(h)?))) else { continue };
+            let Some(nf) = self.files.iter().position(|x| &x.path == path) else { continue };
+            // The same lines may well have moved (staging the hunk above changes the index's
+            // line numbers): take the nearest identical hunk.
+            let dist = |x: &Hunk| x.old_start.abs_diff(was.old_start) + x.new_start.abs_diff(was.new_start);
+            let same = self.files[nf].hunks.iter().enumerate().filter(|(_, x)| x.lines == was.lines);
+            if let Some((nh, _)) = same.min_by_key(|(_, x)| dist(x)) {
+                self.selected.extend(lines.into_iter().map(|l| (nf, nh, l)));
+            }
+        }
+    }
+
     /// Word-level change ranges for one line (computed lazily against its partner line).
     fn word_ranges(&mut self, f: usize, h: usize, l: usize) -> &[(usize, usize)] {
         if !self.words.contains_key(&(f, h, l)) {
@@ -475,24 +511,53 @@ impl DiffView {
         self.spans = spans;
     }
 
-    /// Click/drag line selection for staging. `key` is the line under the cursor in `cell`.
-    fn select_line(&mut self, ui: &mut Ui, cell: Rect, key: (usize, usize, usize)) {
-        if !ui.hovered(cell) {
-            return;
+    /// The `+`/`-` line shown at a row (on one side, in split view).
+    fn line_at(&self, row: usize, split: bool, side: usize) -> Option<(usize, usize, usize)> {
+        let (f, h, l, _) = self.row_line(row, split, side)?;
+        self.files[f].hunks[h].lines[l].starts_with(['+', '-']).then_some((f, h, l))
+    }
+
+    fn set_selected(&mut self, key: (usize, usize, usize), on: bool) {
+        if on {
+            self.selected.insert(key);
+        } else {
+            self.selected.remove(&key);
         }
-        ui.cursor = Cursor::Pointer;
-        let sel = self.selected.contains(&key);
-        if ui.input.pressed {
-            self.drag = Some(!sel);
-        }
-        if let Some(state) = self.drag {
-            if ui.input.down || ui.input.pressed {
-                if state {
-                    self.selected.insert(key);
-                } else {
-                    self.selected.remove(&key);
-                }
+    }
+
+    /// Click / drag line selection. A press on a `+`/`-` line (`hover`: its row, side and key)
+    /// flips it and starts a drag that gives every line it passes the same state, including rows
+    /// the pointer skipped between two frames. In split view a drag stays on its side. Dragging
+    /// past the top or bottom edge scrolls.
+    fn drag_select(&mut self, ui: &mut Ui, r: Rect, off: f32, split: bool, hover: Option<(usize, usize, (usize, usize, usize))>) {
+        if let Some((row, side, key)) = hover {
+            ui.cursor = Cursor::Pointer;
+            if ui.input.pressed {
+                let on = !self.selected.contains(&key);
+                self.set_selected(key, on);
+                self.drag = Some(Drag { on, side, row });
+                return;
             }
+        }
+        let (Some(mut d), true) = (self.drag, ui.input.down) else { return };
+        let (_, my) = ui.input.mouse;
+        if my <= -1000.0 {
+            return; // the pointer left the window
+        }
+        let rows = self.rows(split).len();
+        let y = my.clamp(r.y, r.bottom() - 1.0);
+        let row = (((y - r.y + off) / DIFF_ROW_H).max(0.0) as usize).min(rows.saturating_sub(1));
+        for i in d.row.min(row)..=d.row.max(row) {
+            if let Some(key) = self.line_at(i, split, d.side) {
+                self.set_selected(key, d.on);
+            }
+        }
+        d.row = row;
+        self.drag = Some(d);
+        let past = if my < r.y { my - r.y } else { (my - r.bottom()).max(0.0) };
+        if past != 0.0 {
+            self.scroll.target = (self.scroll.target + past.clamp(-60.0, 60.0) * ui.dt * 12.0).clamp(0.0, self.scroll.max);
+            ui.animating = true;
         }
     }
 
@@ -537,6 +602,7 @@ impl DiffView {
             ui.wake_in(std::time::Duration::from_millis(50));
         }
         let mut hover_who: Option<BlameCommit> = None;
+        let mut hover_line = None;
 
         ui.p.push_clip(r);
         for i in first..last {
@@ -583,24 +649,20 @@ impl DiffView {
                 DRow::Hunk(fi, hi) => {
                     ui.p.rect(row, theme::ACCENT.alpha(0.07));
                     let header = self.files[fi].hunks[hi].header.clone();
-                    let n = self.selected_in(fi, hi);
+                    // A hunk with selected lines acts on the file's whole selection (it may
+                    // span several hunks); one without acts on itself.
+                    let n = if self.selected_in(fi, hi) > 0 { self.selected_in_file(fi) } else { 0 };
+                    let lines = format!("{n} line{}", plural(n));
                     let path = self.files[fi].path.clone();
                     // (label, is_discard, primary)
                     let buttons: Vec<(String, bool, bool)> = match self.mode {
-                        DiffMode::Unstaged if n == 0 => {
-                            vec![("Discard hunk".into(), true, false), ("Stage hunk".into(), false, false)]
+                        DiffMode::Unstaged | DiffMode::Untracked if n > 0 => {
+                            vec![(format!("Discard {lines}"), true, false), (format!("Stage {lines}"), false, true)]
                         }
-                        DiffMode::Unstaged => vec![
-                            (format!("Discard {n} line{}", plural(n)), true, false),
-                            (format!("Stage {n} line{}", plural(n)), false, true),
-                        ],
-                        DiffMode::Staged if n == 0 => vec![("Unstage hunk".into(), false, false)],
-                        DiffMode::Staged => vec![(format!("Unstage {n} line{}", plural(n)), false, true)],
-                        DiffMode::Untracked if n == 0 => vec![("Delete file".into(), true, false), ("Stage file".into(), false, false)],
-                        DiffMode::Untracked => vec![
-                            (format!("Discard {n} line{}", plural(n)), true, false),
-                            (format!("Stage {n} line{}", plural(n)), false, true),
-                        ],
+                        DiffMode::Staged if n > 0 => vec![(format!("Discard {lines}"), true, false), (format!("Unstage {lines}"), false, true)],
+                        DiffMode::Unstaged => vec![("Discard hunk".into(), true, false), ("Stage hunk".into(), false, false)],
+                        DiffMode::Staged => vec![("Discard hunk".into(), true, false), ("Unstage hunk".into(), false, false)],
+                        DiffMode::Untracked => vec![("Delete file".into(), true, false), ("Stage file".into(), false, false)],
                         DiffMode::Commit => vec![],
                     };
                     let widths: Vec<f32> = buttons.iter().map(|b| ui.p.measure(UI, 12.5, &b.0) + 22.0).collect();
@@ -611,11 +673,11 @@ impl DiffView {
                         let b = Rect::new(bx, y + 1.0, w, DIFF_ROW_H - 2.0);
                         let hit = if discard { ui.danger_button(b, &label) } else { ui.button(b, &label, primary, true) };
                         if hit {
-                            action = Some(match (self.mode, discard) {
-                                (DiffMode::Untracked, true) if n == 0 => DiffAction::DeleteUntracked(path.clone()),
-                                (DiffMode::Untracked, false) if n == 0 => DiffAction::StageFile(path.clone()),
-                                (_, true) => DiffAction::Discard { f: fi, h: hi, lines_only: n > 0 },
-                                (_, false) => DiffAction::Hunk { f: fi, h: hi, lines_only: n > 0 },
+                            action = Some(match self.mode {
+                                _ if n > 0 => DiffAction::Lines { f: fi, discard },
+                                DiffMode::Untracked if discard => DiffAction::DeleteUntracked(path.clone()),
+                                DiffMode::Untracked => DiffAction::StageFile(path.clone()),
+                                _ => DiffAction::Hunk { f: fi, h: hi, discard },
                             });
                         }
                         bx += w + 6.0;
@@ -649,8 +711,8 @@ impl DiffView {
                     };
                     if tag == b'+' || tag == b'-' {
                         ui.p.text(ux + 2.0 * num_w + 6.0, row.cy(), MONO, CODE_SIZE, &(tag as char).to_string(), sign_color);
-                        if selectable {
-                            self.select_line(ui, Rect::new(ux, y, r.w - aw, DIFF_ROW_H), (f, h, l));
+                        if selectable && ui.hovered(Rect::new(ux, y, r.w - aw, DIFF_ROW_H)) {
+                            hover_line = Some((i, 0, (f, h, l)));
                         }
                     }
                 }
@@ -679,8 +741,8 @@ impl DiffView {
                             }
                         }
                         num(ui, x0 + aw + num_w - 6.0, row.cy(), if side == 0 { old } else { new });
-                        if changed && selectable {
-                            self.select_line(ui, Rect::new(x0 + aw, y, half - aw, DIFF_ROW_H), (f, h, l));
+                        if changed && selectable && ui.hovered(Rect::new(x0 + aw, y, half - aw, DIFF_ROW_H)) {
+                            hover_line = Some((i, side, (f, h, l)));
                         }
                     }
                     ui.p.rect(Rect::new(rx - 0.5, y, 1.0, DIFF_ROW_H), theme::BORDER);
@@ -697,6 +759,9 @@ impl DiffView {
             }
         }
         ui.p.pop_clip();
+        if selectable {
+            self.drag_select(ui, r, off, split, hover_line);
+        }
 
         // Code text in its own clip(s), so horizontal scrolling never bleeds into the gutters.
         let columns: Vec<(Rect, Option<usize>)> = if split {
@@ -809,6 +874,49 @@ mod tests {
         ui.input.mouse = (900.0 - 30.0, 1.5 * DIFF_ROW_H);
         ui.input.pressed = true;
         let a = v.draw(&mut ui, r, false, false);
-        assert!(matches!(a, Some(DiffAction::Hunk { f: 0, h: 0, lines_only: true })));
+        assert!(matches!(a, Some(DiffAction::Lines { f: 0, discard: false })));
+    }
+
+    #[test]
+    fn a_quick_drag_selects_every_line_it_passes() {
+        let lines: Vec<String> = (0..12).map(|i| format!("+l{i}")).collect();
+        let fd = FileDiff { path: "q".into(), hunks: vec![Hunk { header: "@@ -0,0 +1,12 @@".into(), old_start: 0, new_start: 1, lines }], ..Default::default() };
+        let mut v = DiffView::new(vec![fd], DiffMode::Untracked, "q".into());
+        let mut ui = Ui::new(crate::font::Fonts::load().unwrap());
+        let r = Rect::new(0.0, 0.0, 900.0, 400.0);
+        // Rows: file, hunk, then line i at row i + 2.
+        let mut frame = |v: &mut DiffView, row: f32, pressed: bool, down: bool| {
+            ui.begin(900.0, 400.0, 1.0);
+            ui.input.mouse = (400.0, (row + 0.5) * DIFF_ROW_H);
+            ui.input.pressed = pressed;
+            ui.input.down = down;
+            v.draw(&mut ui, r, false, false);
+            ui.input.end_frame();
+        };
+        // Press on l1, then the pointer is over l9 by the next frame.
+        frame(&mut v, 3.0, true, true);
+        frame(&mut v, 11.0, false, true);
+        let sel = |v: &DiffView| (0..12).filter(|l| v.selected.contains(&(0, 0, *l))).collect::<Vec<_>>();
+        assert_eq!(sel(&v), (1..=9).collect::<Vec<_>>());
+        // Back up past the start, above the hunk: same state, so l0 joins.
+        frame(&mut v, 0.0, false, true);
+        assert_eq!(sel(&v), (0..=9).collect::<Vec<_>>());
+        frame(&mut v, 0.0, false, false);
+        // A press on a selected line starts unselecting.
+        frame(&mut v, 5.0, true, true);
+        frame(&mut v, 8.0, false, true);
+        assert_eq!(sel(&v), [0, 1, 2, 7, 8, 9]);
+    }
+
+    #[test]
+    fn a_reloaded_diff_keeps_the_selection_on_unchanged_hunks() {
+        let hunk = |start: u32, lines: &[&str]| Hunk { header: String::new(), old_start: start, new_start: start, lines: lines.iter().map(|l| l.to_string()).collect() };
+        let file = |hunks: Vec<Hunk>| vec![FileDiff { path: "k".into(), hunks, ..Default::default() }];
+        let mut old = DiffView::new(file(vec![hunk(1, &[" a", "-b", "+B"]), hunk(20, &[" c", "+d"]), hunk(40, &[" e", "+f"])]), DiffMode::Unstaged, "U:k".into());
+        old.selected.extend([(0, 0, 1), (0, 1, 1), (0, 2, 1)]);
+        // The first hunk is gone, the second moved up unchanged, the third changed.
+        let mut new = DiffView::new(file(vec![hunk(19, &[" c", "+d"]), hunk(39, &[" e", "+F"])]), DiffMode::Unstaged, "U:k".into());
+        new.keep_selection(&old);
+        assert_eq!(new.selected, HashSet::from([(0, 0, 1)]));
     }
 }

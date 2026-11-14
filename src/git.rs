@@ -266,6 +266,10 @@ pub struct Ref {
     pub is_head: bool,
     pub ahead: u32,
     pub behind: u32,
+    /// Local branches: the remote branch it tracks ("origin/main"), or empty.
+    pub upstream: String,
+    /// The upstream is configured but its remote branch no longer exists.
+    pub gone: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -367,7 +371,7 @@ impl Repo {
     pub fn refs(&self) -> Result<Vec<Ref>, String> {
         let out = self.git(&[
             "for-each-ref",
-            "--format=%(refname)%1f%(objectname)%1f%(*objectname)%1f%(HEAD)%1f%(upstream:track)",
+            "--format=%(refname)%1f%(objectname)%1f%(*objectname)%1f%(HEAD)%1f%(upstream:track)%1f%(upstream:short)",
             "refs/heads",
             "refs/remotes",
             "refs/tags",
@@ -375,7 +379,7 @@ impl Repo {
         let mut refs = Vec::new();
         for line in out.lines() {
             let f: Vec<&str> = line.split('\x1f').collect();
-            if f.len() < 5 {
+            if f.len() < 6 {
                 continue;
             }
             let full = f[0];
@@ -402,6 +406,8 @@ impl Repo {
                 is_head: f[3] == "*",
                 ahead: num("ahead "),
                 behind: num("behind "),
+                upstream: f[5].to_string(),
+                gone: f[4] == "[gone]",
             });
         }
         Ok(refs)
@@ -582,9 +588,10 @@ impl Repo {
         self.git(&["rev-parse", "--verify", "-q", rev]).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
     }
 
-    /// Cheap fingerprint of every ref + HEAD; if unchanged, the history doesn't need reloading.
+    /// Cheap fingerprint of every ref + HEAD (and what each branch tracks); if unchanged, the
+    /// history and branch list don't need reloading.
     pub fn refs_signature(&self) -> String {
-        let refs = self.git(&["for-each-ref", "--format=%(objectname) %(refname)"]).unwrap_or_default();
+        let refs = self.git(&["for-each-ref", "--format=%(objectname) %(refname) %(upstream)"]).unwrap_or_default();
         let head = self.git(&["rev-parse", "-q", "HEAD"]).unwrap_or_default();
         format!("{head}\n{refs}")
     }
@@ -615,12 +622,39 @@ impl Repo {
 
     /// Applies a patch to the working tree (used by discard and its undo).
     pub fn apply_worktree(&self, patch: &str, reverse: bool) -> Result<String, String> {
+        self.apply_worktree_args(patch, reverse, false)
+    }
+
+    fn apply_worktree_args(&self, patch: &str, reverse: bool, check: bool) -> Result<String, String> {
         let mut args = vec!["apply", "--recount", "--whitespace=nowarn", "--binary"];
         if reverse {
             args.push("-R");
         }
+        if check {
+            args.push("--check");
+        }
         args.push("-");
         self.git_in(&args, patch.as_bytes())
+    }
+
+    /// Discards staged changes, or some of their lines, from both the index and the working tree
+    /// (`file` is from the staged diff; see `lines_patch`). Changes nothing unless both take it,
+    /// i.e. unless the working tree still has those lines as staged. Returns the reverse-applied
+    /// patches (index, working tree) for undo.
+    pub fn discard_staged(&self, file: &FileDiff, hunks: &[usize], selected: Option<&dyn Fn(usize, usize) -> bool>) -> Result<(String, String), String> {
+        let index = lines_patch(file, hunks, selected, true, &|n| n);
+        // The same lines in the working tree sit wherever its unstaged changes moved them.
+        let out = self.git(&["diff", "--no-color", "--no-ext-diff", "-U0", "--src-prefix=a/", "--dst-prefix=b/", "--", &file.path])?;
+        let unstaged: Vec<Hunk> = parse_diff(&out).into_iter().flat_map(|f| f.hunks).collect();
+        let worktree = lines_patch(file, hunks, selected, true, &line_map(&unstaged));
+        let changed_again = |e: String| format!("Not discarded: {} has newer changes to these lines in the working tree\n{e}", file.path);
+        self.apply_worktree_args(&worktree, true, true).map_err(changed_again)?;
+        self.apply_cached(&index, true)?;
+        if let Err(e) = self.apply_worktree(&worktree, true) {
+            let _ = self.apply_cached(&index, false);
+            return Err(changed_again(e));
+        }
+        Ok((index, worktree))
     }
 
     /// The full unstaged patch of one file, binary-safe.
@@ -737,6 +771,12 @@ impl Repo {
             }
         }
         v
+    }
+
+    /// A branch's raw upstream settings (`branch.<name>.remote` and `.merge`), to put back later.
+    pub fn upstream_config(&self, branch: &str) -> Option<(String, String)> {
+        let get = |key: &str| self.git(&["config", "--get", &format!("branch.{branch}.{key}")]).ok().map(|s| s.trim().to_string());
+        Some((get("remote")?, get("merge")?))
     }
 
     /// The current branch's upstream, e.g. "origin/main".
@@ -872,7 +912,7 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
 pub fn parse_diff(text: &str) -> Vec<FileDiff> {
     let mut files: Vec<FileDiff> = Vec::new();
     let mut in_hunk = false;
-    for line in text.split('\n') {
+    for line in text.strip_suffix('\n').unwrap_or(text).split('\n') {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             let path = rest.rsplit_once(" b/").map_or(rest, |(_, b)| b).to_string();
             files.push(FileDiff { header: vec![line.to_string()], path, ..Default::default() });
@@ -891,14 +931,13 @@ pub fn parse_diff(text: &str) -> Vec<FileDiff> {
             f.hunks.push(Hunk { header: line.to_string(), old_start, new_start, lines: vec![] });
             in_hunk = true;
         } else if in_hunk {
-            if line.is_empty() {
-                continue; // trailing newline at end of output
-            }
-            match line.as_bytes()[0] {
-                b'+' => f.adds += 1,
-                b'-' => f.dels += 1,
+            match line.as_bytes().first() {
+                Some(b'+') => f.adds += 1,
+                Some(b'-') => f.dels += 1,
                 _ => {}
             }
+            // An empty line is a blank context line, as `diff.suppressBlankEmpty` prints it.
+            let line = if line.is_empty() { " " } else { line };
             f.hunks.last_mut().unwrap().lines.push(line.to_string());
         } else {
             if let Some(p) = line.strip_prefix("+++ b/") {
@@ -916,53 +955,130 @@ pub fn parse_diff(text: &str) -> Vec<FileDiff> {
     files
 }
 
-/// Builds a patch containing one hunk, optionally restricted to the selected `+`/`-` lines.
+/// Builds a patch from some of a file's hunks (ascending), optionally restricted to the selected
+/// `+`/`-` lines: `selected(hunk, line)`.
 ///
-/// For staging (`reverse == false`, applied forward to the index) unselected `-` lines become
-/// context and unselected `+` lines are dropped. For unstaging (`reverse == true`, applied with
-/// `-R`) it's the mirror image. Hunk counts are recomputed by `git apply --recount`.
-pub fn hunk_patch(file: &FileDiff, hunk: usize, selected: Option<&dyn Fn(usize) -> bool>, reverse: bool) -> String {
-    let h = &file.hunks[hunk];
+/// Staging (`reverse == false`) applies the patch forward to the diff's old side (the index), so
+/// unselected `-` lines become context and unselected `+` lines are dropped. Unstaging and
+/// discarding (`reverse == true`) apply it with `-R` to the diff's new side (the index, or the
+/// working tree), which is the mirror image. Hunk counts are recomputed by `git apply --recount`.
+///
+/// Each hunk header says where the hunk sits in the file being patched once the patch's earlier
+/// hunks are in. Git starts looking for a hunk's lines there and takes the nearest match, so a
+/// position that is off (the other side's line number, say) puts lines in the wrong place in a
+/// file with repeated blocks. `at` maps a line of the diff's side to the file actually patched,
+/// when that one differs elsewhere (the working tree, for a patch made from the staged diff).
+pub fn lines_patch(file: &FileDiff, hunks: &[usize], selected: Option<&dyn Fn(usize, usize) -> bool>, reverse: bool, at: &dyn Fn(u32) -> u32) -> String {
     let mut body = String::new();
-    let (mut old_n, mut new_n) = (0, 0);
-    let mut last_kept = false;
-    for (i, line) in h.lines.iter().enumerate() {
-        let sel = selected.is_none_or(|f| f(i));
-        let rest = line.get(1..).unwrap_or("");
-        let mut keep = |s: String, o: u32, n: u32| {
-            body.push_str(&s);
-            body.push('\n');
-            old_n += o;
-            new_n += n;
-            true
-        };
-        last_kept = match line.as_bytes().first() {
-            Some(b'+') if sel => keep(line.clone(), 0, 1),
-            Some(b'+') if reverse => keep(format!(" {rest}"), 1, 1),
-            Some(b'+') => false,
-            Some(b'-') if sel => keep(line.clone(), 1, 0),
-            Some(b'-') if !reverse => keep(format!(" {rest}"), 1, 1),
-            Some(b'-') => false,
-            Some(b'\\') => last_kept && keep(line.clone(), 0, 0),
-            _ => keep(line.clone(), 1, 1),
-        };
+    let (mut old_total, mut new_total) = (0, 0);
+    // How far the hunks so far move the lines after them.
+    let mut shift = 0i64;
+    for &hi in hunks {
+        let h = &file.hunks[hi];
+        let (lines, old_n, new_n) = hunk_lines(h, &|l| selected.is_none_or(|f| f(hi, l)), reverse);
+        // The hunk's first line in the file being patched (an empty side is numbered by the line
+        // before it).
+        let (start, side) = if reverse { (h.new_start, b'+') } else { (h.old_start, b'-') };
+        let empty = !h.lines.iter().any(|l| l.as_bytes().first().is_some_and(|&t| t == b' ' || t == side));
+        let first = at(start + empty as u32) as i64;
+        let (patched_n, result_n) = if reverse { (new_n, old_n) } else { (old_n, new_n) };
+        let pos = |p: i64, n: u32| if n > 0 { p } else { (p - 1).max(0) };
+        let (p, r) = (pos(first, patched_n), pos(first + shift, result_n));
+        let (o, n) = if reverse { (r, p) } else { (p, r) };
+        body.push_str(&format!("@@ -{o},{old_n} +{n},{new_n} @@\n"));
+        body.push_str(&lines);
+        shift += result_n as i64 - patched_n as i64;
+        old_total += old_n;
+        new_total += new_n;
     }
     // A partial selection can leave lines on the side the header says is empty: lines unstaged
     // from (or discarded in) a new file, lines staged from a deleted one. Git rejects that
     // ("new file depends on old contents"), so such a patch becomes a plain modification.
     let created = file.header.iter().any(|l| l.starts_with("new file mode"));
     let deleted = file.header.iter().any(|l| l.starts_with("deleted file mode"));
-    let header = if (created && old_n > 0) || (deleted && new_n > 0) { modification_header(&file.header) } else { file.header.clone() };
+    let header = if (created && old_total > 0) || (deleted && new_total > 0) { modification_header(&file.header) } else { file.header.clone() };
     let mut out = String::new();
     for l in &header {
         out.push_str(l);
         out.push('\n');
     }
-    // A side with lines starts at line 1 (new and deleted files number the empty side 0).
-    let start = |s: u32, n: u32| if n > 0 { s.max(1) } else { s };
-    out.push_str(&format!("@@ -{},{} +{},{} @@\n", start(h.old_start, old_n), old_n, start(h.new_start, new_n), new_n));
     out.push_str(&body);
     out
+}
+
+/// One hunk's body for [`lines_patch`], with its old and new line counts.
+fn hunk_lines(h: &Hunk, selected: &dyn Fn(usize) -> bool, reverse: bool) -> (String, u32, u32) {
+    // (text, ends with a newline, on the old side, on the new side). Unselected lines stay as
+    // they are in the file being patched, and don't make it into the result.
+    let mut lines: Vec<(&str, bool, bool, bool)> = Vec::with_capacity(h.lines.len());
+    for (i, l) in h.lines.iter().enumerate() {
+        let tag = l.as_bytes().first().copied().unwrap_or(b' ');
+        if tag == b'\\' {
+            // "\ No newline at end of file" is about the line before it.
+            if let Some(prev) = lines.last_mut() {
+                prev.1 = false;
+            }
+            continue;
+        }
+        let (old, new) = match (tag, selected(i)) {
+            (b'-', true) => (true, false),
+            (b'+', true) => (false, true),
+            (b'-', false) => (!reverse, !reverse),
+            (b'+', false) => (reverse, reverse),
+            _ => (true, true),
+        };
+        lines.push((l.get(1..).unwrap_or(""), true, old, new));
+    }
+    lines.retain(|l| l.2 || l.3);
+    // The file being patched keeps its line endings exactly. In the result only the very last
+    // line may lack a newline, so a line that used to end the file but is now followed by
+    // another one gains one (on that side only, which takes a `-`/`+` pair for a context line).
+    let last_old = lines.iter().rposition(|l| l.2);
+    let last_new = lines.iter().rposition(|l| l.3);
+    let mut out = String::new();
+    let mut emit = |tag: char, text: &str, newline: bool| {
+        out.push(tag);
+        out.push_str(text);
+        out.push('\n');
+        if !newline {
+            out.push_str("\\ No newline at end of file\n");
+        }
+    };
+    let (mut old_n, mut new_n) = (0, 0);
+    for (k, &(text, nl, old, new)) in lines.iter().enumerate() {
+        let old_nl = nl || (reverse && Some(k) != last_old);
+        let new_nl = nl || (!reverse && Some(k) != last_new);
+        match (old, new) {
+            (true, true) if old_nl == new_nl => emit(' ', text, old_nl),
+            (true, true) => {
+                emit('-', text, old_nl);
+                emit('+', text, new_nl);
+            }
+            (true, false) => emit('-', text, old_nl),
+            _ => emit('+', text, new_nl),
+        }
+        old_n += old as u32;
+        new_n += new as u32;
+    }
+    (out, old_n, new_n)
+}
+
+/// For a zero-context diff's hunks, maps a line number on the diff's old side to the same line on
+/// its new side (lines inside a changed range map to where the range starts).
+pub fn line_map(hunks: &[Hunk]) -> impl Fn(u32) -> u32 + '_ {
+    move |line| {
+        let mut shift = 0i64;
+        for h in hunks {
+            let count = |t: u8| h.lines.iter().filter(|l| l.as_bytes().first() == Some(&t)).count() as i64;
+            let (dels, adds) = (count(b'-'), count(b'+'));
+            // The old side's first line after the hunk (a pure insertion comes after its start).
+            if h.old_start as i64 + dels.max(1) > line as i64 {
+                break;
+            }
+            shift += adds - dels;
+        }
+        (line as i64 + shift).max(1) as u32
+    }
 }
 
 /// A new-file or deleted-file patch header rewritten as a modification of the same path.
@@ -1092,6 +1208,14 @@ mod tests {
         run(&dir, &["add", "."], None).unwrap();
         run(&dir, &["commit", "-qm", "init"], None).unwrap();
         Repo::open(&dir).unwrap()
+    }
+
+    /// A patch of one hunk, optionally restricted to the selected `+`/`-` lines.
+    fn hunk_patch(file: &FileDiff, hunk: usize, selected: Option<&dyn Fn(usize) -> bool>, reverse: bool) -> String {
+        match selected {
+            Some(f) => lines_patch(file, &[hunk], Some(&|_, l| f(l)), reverse, &|n| n),
+            None => lines_patch(file, &[hunk], None, reverse, &|n| n),
+        }
     }
 
     /// Indices of the hunk lines equal to one of `want` (e.g. "+y").
@@ -1227,6 +1351,111 @@ mod tests {
         repo.apply_cached(&hunk_patch(&files[0], 0, Some(&sel), true), true).unwrap();
         assert_eq!(repo.git(&["show", ":f.txt"]).unwrap(), "a\nB\nc\nd\n");
         let _ = std::fs::remove_dir_all(&repo.root);
+    }
+
+    /// `lines` joined, ending in a newline or not.
+    fn text_of(lines: &[&str], eol: bool) -> String {
+        lines.join("\n") + if eol { "\n" } else { "" }
+    }
+
+    #[test]
+    fn staged_lines_land_where_they_are_in_repeated_blocks() {
+        // Two lines added at the top, and "X" between blocks that repeat every two lines further
+        // down. Staging just "X" used to put it two lines too low: the patch said where X sits in
+        // the working tree (below the two new lines), and git takes the nearest spot where the
+        // lines around it match.
+        let repo = temp_repo("repeated");
+        let pairs = |n: usize| (0..n).flat_map(|_| ["a", "b"]).collect::<Vec<_>>();
+        std::fs::write(repo.root.join("r"), text_of(&[vec!["top"], pairs(10)].concat(), true)).unwrap();
+        repo.stage(&["r"]).unwrap();
+        std::fs::write(repo.root.join("r"), text_of(&[vec!["top", "n1", "n2"], pairs(5), vec!["X"], pairs(5)].concat(), true)).unwrap();
+        let fd = &repo.diff_file("r", false, &DiffOpts::default()).unwrap()[0];
+        assert_eq!(fd.hunks.len(), 2);
+        let x = fd.hunks[1].lines.iter().position(|l| l == "+X").unwrap();
+        repo.apply_cached(&lines_patch(fd, &[1], Some(&|h, l| (h, l) == (1, x)), false, &|n| n), false).unwrap();
+        assert_eq!(repo.git(&["show", ":r"]).unwrap(), text_of(&[vec!["top"], pairs(5), vec!["X"], pairs(5)].concat(), true));
+        let _ = std::fs::remove_dir_all(&repo.root);
+    }
+
+    #[test]
+    fn line_selection_at_a_missing_final_newline_keeps_lines_apart() {
+        // "x\ny" becomes "x\nz", neither with a final newline, so both sides of the hunk end in
+        // "\ No newline at end of file". Picking one of the two lines used to leave that marker on
+        // a line that is no longer last, which glued it to the next one ("x\nyz").
+        let repo = temp_repo("eof");
+        let read = |p: &str| std::fs::read_to_string(repo.root.join(p)).unwrap();
+        std::fs::write(repo.root.join("e"), "x\ny").unwrap();
+        repo.stage(&["e"]).unwrap();
+        repo.commit("e", false).unwrap();
+        std::fs::write(repo.root.join("e"), "x\nz").unwrap();
+        let fd = &repo.diff_file("e", false, &DiffOpts::default()).unwrap()[0];
+        // Stage the new line only: y stays, z follows it.
+        let sel = pick(fd, &["+z"]);
+        repo.apply_cached(&hunk_patch(fd, 0, Some(&|i| sel.contains(&i)), false), false).unwrap();
+        assert_eq!(repo.git(&["show", ":e"]).unwrap(), "x\ny\nz");
+        // Discard the removal only: y comes back, in front of z.
+        let sel = pick(fd, &["-y"]);
+        repo.apply_worktree(&hunk_patch(fd, 0, Some(&|i| sel.contains(&i)), true), true).unwrap();
+        assert_eq!(read("e"), "x\ny\nz");
+        // Unstage the removal only, from a staged "x\nz".
+        std::fs::write(repo.root.join("e"), "x\nz").unwrap();
+        repo.stage(&["e"]).unwrap();
+        let fd = &repo.diff_file("e", true, &DiffOpts::default()).unwrap()[0];
+        let sel = pick(fd, &["-y"]);
+        repo.apply_cached(&hunk_patch(fd, 0, Some(&|i| sel.contains(&i)), true), true).unwrap();
+        assert_eq!(repo.git(&["show", ":e"]).unwrap(), "x\ny\nz");
+        let _ = std::fs::remove_dir_all(&repo.root);
+    }
+
+    #[test]
+    fn discard_staged_lines_from_index_and_working_tree() {
+        let repo = temp_repo("discard-staged");
+        let nums: Vec<String> = (1..=20).map(|i| i.to_string()).collect();
+        let text = |v: &[String]| v.join("\n") + "\n";
+        std::fs::write(repo.root.join("n"), text(&nums)).unwrap();
+        repo.stage(&["n"]).unwrap();
+        repo.commit("n", false).unwrap();
+        // Staged: 3 → three (first hunk), 17 → seventeen (second hunk).
+        let mut staged = nums.clone();
+        staged[2] = "three".into();
+        staged[16] = "seventeen".into();
+        std::fs::write(repo.root.join("n"), text(&staged)).unwrap();
+        repo.stage(&["n"]).unwrap();
+        // Unstaged on top: a new first line, so the working tree's line numbers differ.
+        let wt: Vec<String> = [vec!["0".to_string()], staged.clone()].concat();
+        std::fs::write(repo.root.join("n"), text(&wt)).unwrap();
+
+        let fd = &repo.diff_file("n", true, &DiffOpts::default()).unwrap()[0];
+        assert_eq!(fd.hunks.len(), 2);
+        let sel = pick(fd, &["-3", "+three"]);
+        let (index_patch, wt_patch) = repo.discard_staged(fd, &[0], Some(&|h, l| h == 0 && sel.contains(&l))).unwrap();
+        let mut want = nums.clone();
+        want[16] = "seventeen".into();
+        assert_eq!(repo.git(&["show", ":n"]).unwrap(), text(&want));
+        assert_eq!(std::fs::read_to_string(repo.root.join("n")).unwrap(), text(&[vec!["0".to_string()], want].concat()));
+        // Both patches put back the way they came (undo).
+        repo.apply_worktree(&wt_patch, false).unwrap();
+        repo.apply_cached(&index_patch, false).unwrap();
+        assert_eq!(repo.git(&["show", ":n"]).unwrap(), text(&staged));
+        assert_eq!(std::fs::read_to_string(repo.root.join("n")).unwrap(), text(&wt));
+
+        // Lines edited again in the working tree are left alone, and so is the index.
+        let mut edited = wt.clone();
+        edited[3] = "THREE".into();
+        std::fs::write(repo.root.join("n"), text(&edited)).unwrap();
+        let e = repo.discard_staged(fd, &[0], Some(&|h, l| h == 0 && sel.contains(&l))).unwrap_err();
+        assert!(e.starts_with("Not discarded"), "{e}");
+        assert_eq!(repo.git(&["show", ":n"]).unwrap(), text(&staged));
+        assert_eq!(std::fs::read_to_string(repo.root.join("n")).unwrap(), text(&edited));
+        let _ = std::fs::remove_dir_all(&repo.root);
+    }
+
+    #[test]
+    fn blank_context_lines_survive_suppress_blank_empty() {
+        // With diff.suppressBlankEmpty git prints a blank context line as an empty line.
+        let out = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n\n-b\n+c\n";
+        let fd = &parse_diff(out)[0];
+        assert_eq!(fd.hunks[0].lines, [" a", " ", "-b", "+c"]);
     }
 
     #[test]
@@ -1387,5 +1616,195 @@ mod tests {
         assert_eq!(log.len(), 1);
         assert!(log[0].is_head());
         let _ = std::fs::remove_dir_all(&repo.root);
+    }
+
+    /// Random edits (repetitive content, missing final newlines) and random line selections,
+    /// staged, discarded and unstaged, each checked against what that selection should give.
+    /// A few hundred git calls, so it only runs on request:
+    /// `cargo test fuzz_line_selection -- --ignored` (vary with ITERS, SEED, CTX).
+    #[test]
+    #[ignore]
+    fn fuzz_line_selection() {
+        let repo = temp_repo("fuzz");
+        let iters: usize = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+        let mut seed: u64 = std::env::var("SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0x9e37_79b9_7f4a_7c15);
+        let ctx: u32 = std::env::var("CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+        let mut rnd = move |n: usize| -> usize {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n.max(1) as u64) as usize
+        };
+        const ALPHA: [&str; 8] = ["a", "b", "c", "}", "", "x", "y", "{"];
+        type Text = Vec<(String, bool)>;
+        fn text(lines: &[String], eol: bool) -> Text {
+            let n = lines.len();
+            lines.iter().enumerate().map(|(i, l)| (l.clone(), i + 1 < n || eol)).collect()
+        }
+        fn ser(t: &[(String, bool)]) -> String {
+            let n = t.len();
+            let mut s = String::new();
+            for (i, (l, nl)) in t.iter().enumerate() {
+                s.push_str(l);
+                if *nl || i + 1 < n {
+                    s.push('\n');
+                }
+            }
+            s
+        }
+        // (index into hunk.lines, tag, text, ends with newline)
+        fn parsed(h: &Hunk) -> Vec<(usize, u8, String, bool)> {
+            let mut out: Vec<(usize, u8, String, bool)> = vec![];
+            for (i, l) in h.lines.iter().enumerate() {
+                match l.as_bytes().first() {
+                    Some(b'\\') => {
+                        if let Some(last) = out.last_mut() {
+                            last.3 = false;
+                        }
+                    }
+                    Some(&t) => out.push((i, t, l[1..].to_string(), true)),
+                    None => out.push((i, b' ', String::new(), true)),
+                }
+            }
+            out
+        }
+        fn expect(target: &Text, h: &Hunk, sel: &dyn Fn(usize) -> bool, reverse: bool) -> String {
+            let p = parsed(h);
+            let (side_tag, start) = if reverse { (b'+', h.new_start) } else { (b'-', h.old_start) };
+            let n = p.iter().filter(|x| x.1 == b' ' || x.1 == side_tag).count();
+            let begin = if n > 0 { start as usize - 1 } else { start as usize };
+            let mut out: Text = target[..begin].to_vec();
+            for (i, t, s, nl) in &p {
+                let keep = match (*t, reverse) {
+                    (b' ', _) => true,
+                    (b'-', false) => !sel(*i),
+                    (b'+', false) => sel(*i),
+                    (b'+', true) => !sel(*i),
+                    (b'-', true) => sel(*i),
+                    _ => true,
+                };
+                if keep {
+                    out.push((s.clone(), *nl));
+                }
+            }
+            out.extend_from_slice(&target[begin + n..]);
+            let len = out.len();
+            for (i, l) in out.iter_mut().enumerate() {
+                if i + 1 < len {
+                    l.1 = true;
+                }
+            }
+            ser(&out)
+        }
+        let p = "z.txt";
+        let file = repo.root.join(p);
+        let opts = DiffOpts { context: ctx, ignore_ws: false };
+        let (mut runs, mut errs, mut wrong) = (0, 0, 0);
+        for it in 0..iters {
+            // Repetitive content, like real code: a short block repeated, lightly mutated.
+            let block: Vec<String> = (0..2 + rnd(4)).map(|_| ALPHA[rnd(ALPHA.len())].to_string()).collect();
+            let n = 1 + rnd(50);
+            let mut old: Vec<String> = (0..n).map(|i| block[i % block.len()].clone()).collect();
+            for _ in 0..rnd(4) {
+                let at = rnd(old.len());
+                old[at] = ALPHA[rnd(ALPHA.len())].to_string();
+            }
+            let old_eol = rnd(3) != 0;
+            let mut new = old.clone();
+            for _ in 0..1 + rnd(6) {
+                match rnd(3) {
+                    0 => {
+                        let at = rnd(new.len() + 1);
+                        for k in 0..1 + rnd(3) {
+                            new.insert(at + k, ALPHA[rnd(ALPHA.len())].to_string());
+                        }
+                    }
+                    1 if !new.is_empty() => {
+                        let at = rnd(new.len());
+                        new.remove(at);
+                    }
+                    _ if !new.is_empty() => {
+                        let at = rnd(new.len());
+                        new[at] = ALPHA[rnd(ALPHA.len())].to_string();
+                    }
+                    _ => {}
+                }
+            }
+            let new_eol = if rnd(4) == 0 { !old_eol } else { old_eol };
+            if new.is_empty() {
+                continue;
+            }
+            // Canonical form: "x\n" is one line with a newline, not two.
+            let canon = |t: &Text| -> Text {
+                let s = ser(t);
+                let eol = s.ends_with('\n');
+                let body = s.strip_suffix('\n').unwrap_or(&s);
+                if body.is_empty() && !eol {
+                    return vec![];
+                }
+                let v: Vec<String> = body.split('\n').map(String::from).collect();
+                text(&v, eol)
+            };
+            let (to, tn) = (canon(&text(&old, old_eol)), canon(&text(&new, new_eol)));
+            let (so, sn) = (ser(&to), ser(&tn));
+            if so == sn {
+                continue;
+            }
+            for kind in 0..3 {
+                // 0 = stage (index → worktree diff), 1 = discard (same diff), 2 = unstage (HEAD → index diff).
+                std::fs::write(&file, &so).unwrap();
+                repo.git(&["add", "--", p]).unwrap();
+                if kind == 2 {
+                    repo.git(&["commit", "-qm", "x", "--allow-empty"]).unwrap();
+                    std::fs::write(&file, &sn).unwrap();
+                    repo.git(&["add", "--", p]).unwrap();
+                } else {
+                    std::fs::write(&file, &sn).unwrap();
+                }
+                let fd = &repo.diff_file(p, kind == 2, &opts).unwrap()[0];
+                let hi = rnd(fd.hunks.len());
+                let h = &fd.hunks[hi];
+                let changes: Vec<usize> = h.lines.iter().enumerate().filter(|(_, l)| l.starts_with(['+', '-'])).map(|(i, _)| i).collect();
+                let mut sel: Vec<usize> = changes.iter().copied().filter(|_| rnd(2) == 0).collect();
+                if sel.is_empty() {
+                    sel.push(changes[rnd(changes.len())]);
+                }
+                let pick = |i: usize| sel.contains(&i);
+                let reverse = kind != 0;
+                let patch = hunk_patch(fd, hi, Some(&pick), reverse);
+                let target = if reverse { &tn } else { &to };
+                let want = expect(target, h, &pick, reverse);
+                let r = match kind {
+                    0 => repo.apply_cached(&patch, false),
+                    1 => repo.apply_worktree(&patch, true),
+                    _ => repo.apply_cached(&patch, true),
+                };
+                runs += 1;
+                let got = match (&r, kind) {
+                    (Err(_), _) => None,
+                    (_, 1) => Some(std::fs::read_to_string(&file).unwrap()),
+                    _ => Some(repo.git(&["show", &format!(":{p}")]).unwrap()),
+                };
+                let name = ["stage", "discard", "unstage"][kind];
+                match got {
+                    None => {
+                        errs += 1;
+                        if errs <= 5 {
+                            eprintln!("=== #{it} {name}: ERROR {:?}\nold={so:?}\nnew={sn:?}\nsel={sel:?}\nhunk:\n{}\n{}\npatch:\n{patch}", r, h.header, h.lines.join("\n"));
+                        }
+                    }
+                    Some(g) if g != want => {
+                        wrong += 1;
+                        if wrong <= 8 {
+                            eprintln!("=== #{it} {name}: WRONG\nold={so:?}\nnew={sn:?}\nsel={sel:?}\nhunk {hi}/{}:\n{}\n{}\npatch:\n{patch}want={want:?}\ngot ={g:?}", fd.hunks.len(), h.header, h.lines.join("\n"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        eprintln!("runs={runs} errors={errs} wrong={wrong}");
+        let _ = std::fs::remove_dir_all(&repo.root);
+        assert_eq!((errs, wrong), (0, 0));
     }
 }

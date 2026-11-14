@@ -53,6 +53,17 @@ pub enum Act {
     /// Create a branch at a commit: (name, hash, switch to it).
     CreateBranchAt(String, String, bool),
     DeleteBranch(String),
+    /// Ask which remote branch a local branch should track.
+    PromptUpstream(String),
+    /// Make `branch` track `upstream` ("origin/main"), or nothing.
+    SetUpstream { branch: String, upstream: Option<String> },
+    /// Ask for a tag name (and optional message), then tag this commit.
+    PromptTagAt(String),
+    /// `git tag` (annotated with a message), then optionally push it to a remote.
+    CreateTag { name: String, at: String, message: Option<String>, push: Option<String> },
+    /// Push one tag, or all of them (None), to a remote.
+    PushTag { tag: Option<String>, remote: String },
+    DeleteTag(String),
     ResolveUse(String, bool),
     MarkResolved(String),
     OpenResolver(String),
@@ -116,6 +127,10 @@ pub struct Palette {
     pub branch_at: Option<String>,
     /// When set, the palette is asking for a new worktree's branch name or path.
     pub worktree_from: Option<WtFrom>,
+    /// When set, the palette is asking for a tag name (and message) for this commit.
+    pub tag_at: Option<String>,
+    /// When set, the palette is asking which remote branch this local branch should track.
+    pub upstream_for: Option<String>,
     /// True on the frame the palette opened: the click that opened it must not close it.
     pub fresh: bool,
 }
@@ -127,6 +142,8 @@ impl Palette {
         self.sel = 0;
         self.branch_at = None;
         self.worktree_from = None;
+        self.tag_at = None;
+        self.upstream_for = None;
         self.fresh = true;
     }
 }
