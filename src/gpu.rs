@@ -1,6 +1,6 @@
 //! wgpu renderer: one pipeline, one vertex format, one draw call per clip rect.
-//! Rounded rects, circles and lines are shaded analytically (SDF) in the fragment shader;
-//! text samples a single-channel glyph atlas.
+//! Rounded rects, circles, lines and graph edges are shaded analytically (SDF) in the fragment
+//! shader; text samples a single-channel glyph atlas.
 
 use crate::ui::{Color, Painter, Vertex};
 use std::sync::Arc;
@@ -47,6 +47,30 @@ fn to_linear(c: vec3<f32>) -> vec3<f32> {
     return select(hi, lo, c <= vec3<f32>(0.04045));
 }
 
+// Coverage at signed distance d (logical px) outside a shape: anti-aliased, or with soft > 0 a
+// glow that fades out over that many pixels.
+fn coverage(d: f32, soft: f32) -> f32 {
+    if (soft > 0.0) {
+        let t = clamp(d / soft, 0.0, 1.0);
+        return (1.0 - t) * (1.0 - t);
+    }
+    return clamp(0.5 - d * g.scale, 0.0, 1.0);
+}
+
+fn seg_dist(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
+    let pa = p - a;
+    let ba = b - a;
+    let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+    return length(pa - ba * h);
+}
+
+// The graph's lane-change S-curve: a cubic from a to b with both control points at mid-height.
+fn s_curve(a: vec2<f32>, b: vec2<f32>, t: f32) -> vec2<f32> {
+    let u = 1.0 - t;
+    let my = (a.y + b.y) * 0.5;
+    return vec2<f32>(mix(a.x, b.x, t * t * (3.0 - 2.0 * t)), u * u * u * a.y + 3.0 * u * t * my + t * t * t * b.y);
+}
+
 @fragment
 fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     let mode = i.params.x;
@@ -62,13 +86,30 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
             d = abs(d + i.params.z * 0.5) - i.params.z * 0.5;
         }
         cov = clamp(0.5 - d * g.scale, 0.0, 1.0);
-    } else if (mode > 2.5) {
-        // Capsule (line segment with round caps).
-        let pa = i.px - i.shape.xy;
-        let ba = i.shape.zw - i.shape.xy;
-        let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
-        let d = length(pa - ba * h) - i.params.y;
-        cov = clamp(0.5 - d * g.scale, 0.0, 1.0);
+    } else if (mode > 2.5 && mode < 3.5) {
+        // Capsule (line segment with round caps), optionally soft (a glow).
+        cov = coverage(seg_dist(i.px, i.shape.xy, i.shape.zw) - i.params.y, i.params.z);
+    } else if (mode > 3.5) {
+        // A whole graph edge as one shape: S-curve from shape.xy into shape.zw, then straight
+        // down to params.w. Only uv.x <= y < uv.y is drawn, so the edges of a path can abut
+        // without overlapping and a translucent glow along them stays even.
+        let a = i.shape.xy;
+        let b = i.shape.zw;
+        var d = seg_dist(i.px, b, vec2<f32>(b.x, max(b.y, i.params.w)));
+        if (abs(a.x - b.x) > 0.25) {
+            var prev = a;
+            for (var k = 1; k <= 16; k += 1) {
+                let q = s_curve(a, b, f32(k) / 16.0);
+                d = min(d, seg_dist(i.px, prev, q));
+                prev = q;
+            }
+        } else {
+            d = min(d, seg_dist(i.px, a, b));
+        }
+        cov = coverage(d - i.params.y, i.params.z);
+        if (i.px.y < i.uv.x || i.px.y >= i.uv.y) {
+            cov = 0.0;
+        }
     }
     var rgb = i.color.rgb;
     if (g.linear_out > 0.5) {

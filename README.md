@@ -12,10 +12,10 @@ no egui/iced, no font crates, no libgit2.
 Everything else is in-tree:
 
 - `font.rs`: TrueType parser (cmap 4/12, simple + composite `glyf`, `.ttc`), exact-area coverage rasterizer, shelf-packed glyph atlas. Loads system fonts (SF / Menlo / DejaVu / Segoe; override with `WGITPUI_UI_FONT`, `WGITPUI_MONO_FONT`).
-- `gpu.rs`: one pipeline, one vertex format. Rounded rects, rings and AA lines are analytic SDFs in the fragment shader; text samples the atlas.
+- `gpu.rs`: one pipeline, one vertex format. Rounded rects, rings, AA lines, whole graph edges and soft glows are analytic SDFs in the fragment shader; text samples the atlas.
 - `ui.rs`: immediate-mode painter, layout rects, input, smooth scrolling, text editing.
 - `git.rs`: drives the `git` CLI (porcelain formats), builds partial patches for line staging.
-- `graph.rs`: incremental lane layout for the commit graph.
+- `graph.rs`: incremental lane layout for the commit graph, plus first-parent lines, which branch each commit belongs to, and where a line was merged into others.
 - `rebase.rs`: turns drag-and-drop gestures into `git rebase -i` todo lists.
 - `chrome.rs`: macOS title-bar integration via the Objective-C runtime.
 - `diffview.rs`, `fileview.rs`, `palette.rs`: the diff, blame/file/tree and palette views.
@@ -27,8 +27,9 @@ Everything else is in-tree:
 - **Tabs**: several repositories open at once, each with its own state; background work (history loading, push/fetch) keeps running in inactive tabs. Open with **+** (native folder picker; ⌘T lists recent repos), by dropping a folder on the window, by typing a path in ⌘K, or as command-line arguments. Tabs show branch plus a status dot (yellow = changes, red = merge/rebase in progress), reorder by dragging, and are restored on the next launch. Keys: ⌘T, ⌘O, ⌘W, ⌘1–⌘9, ctrl-tab / ⌘⇧[ ].
 - **Edge-to-edge window** (macOS): transparent title bar, the native traffic lights re-centered inside the top bar (raw Objective-C runtime calls, no crates). Drag empty top-bar space to move, double-click to zoom.
 - **Commit graph** with bezier lane edges, ref pills, and a working-copy node tethered to HEAD.
+- **Branch lineage**: the selected branch's history (its first-parent line, all the way down) is drawn in one color with a soft glow while the rest of the graph steps back. Selecting a branch, or a commit it points at, picks that branch; any other commit picks the line it sits on (main keeps its own line, a merged and deleted branch still forms one); the working copy picks HEAD's branch. Every merge that took the branch into another one gets a glowing ring.
 - **Streaming history**: `git log` is streamed on a background thread into an incremental lane layout, so the first screen paints immediately (100k commits fully load in under a second). Refreshes are skipped entirely when no ref or HEAD moved.
-- **Minimap scrollbar**: branch, tag, HEAD and selection markers across the whole history. Drag to scrub.
+- **Minimap scrollbar**: branch, tag, HEAD and selection markers across the whole history, plus the selected branch: a rail over its own commits and a glowing dot at every merge into another branch. Drag to scrub.
 - **Line-level staging**: click or drag across `+`/`-` lines, then *Stage N lines* / *Unstage N lines*. Hunk and file staging too.
 - **Discard with undo**: discard files, hunks or selected lines (or delete untracked files). Every destructive action goes on an undo stack (`⌘Z`, or *Undo* in the toast), and a copy is written to `.git/wgitpui-trash/` so nothing is ever truly lost.
 - **Undoable commits**: commit, amend and rebase record the previous HEAD; undo resets back to it.

@@ -24,6 +24,8 @@ const MAX_LANES_SHOWN: usize = 14;
 const LIST_ROW_H: f32 = 24.0;
 const MINIMAP_W: f32 = 12.0;
 const MAX_CHAIN: usize = 500;
+/// How far graph lines off the selected branch's history fade toward the background.
+const MUTED: f32 = 0.5;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Sel {
@@ -186,6 +188,35 @@ struct GDrag {
     pushed: HashSet<usize>,
 }
 
+/// Branch names whose line other branches grow out of. They claim shared history first, so a
+/// commit on main's line counts as main's even where a feature branch's first parents run along it.
+const TRUNKS: [&str; 6] = ["main", "master", "trunk", "develop", "development", "dev"];
+
+/// The selected branch's history, picked out in the graph and the minimap: its first-parent line
+/// in one color with a glow, and the merges that took its commits into other branches.
+struct Lineage {
+    /// The row the line starts at (the branch tip).
+    tip: usize,
+    color: Color,
+    /// First-parent history from the tip, rows ascending.
+    chain: Vec<u32>,
+    /// `chain[..own]` are the branch's own commits: those before it joins a trunk's line (for a
+    /// trunk, those before it joins a different one).
+    own: usize,
+    /// (merge row, merged parent row) for each merge that took an own commit into another line.
+    merges: Vec<(u32, u32)>,
+}
+
+impl Lineage {
+    fn has(&self, row: usize) -> bool {
+        self.chain.binary_search(&(row as u32)).is_ok()
+    }
+
+    fn merge_at(&self, row: usize) -> bool {
+        self.merges.binary_search_by_key(&(row as u32), |m| m.0).is_ok()
+    }
+}
+
 pub struct GitApp {
     repo: Option<Repo>,
     // History (streamed in the background).
@@ -202,6 +233,15 @@ pub struct GitApp {
     loading: bool,
     restore_sel: Option<String>,
     chain: Option<Vec<usize>>,
+    /// Per row: the tip row of the branch line it belongs to (`Graph::owners`), and when that
+    /// was worked out. Behind `commits` while history streams in.
+    owners: Vec<u32>,
+    owners_at: Instant,
+    /// Tip rows of trunk branches, with the trunk's rank (`trunk_rank`).
+    trunks: Vec<(u32, usize)>,
+    lineage: Option<Lineage>,
+    /// The remote's default branch, looked up only when no branch has a name from `TRUNKS`.
+    default_branch: Option<String>,
     // Working copy.
     changes: Vec<Change>,
     /// Every working tree of the repository, this one included (change counts filled in).
@@ -282,6 +322,11 @@ impl GitApp {
             loading: false,
             restore_sel: None,
             chain: None,
+            owners: vec![],
+            owners_at: Instant::now(),
+            trunks: vec![],
+            lineage: None,
+            default_branch: None,
             changes: vec![],
             worktrees: vec![],
             op: None,
@@ -646,6 +691,9 @@ impl GitApp {
             self.head_name = head_name;
             self.refs = repo.refs().unwrap_or_default();
             self.local_names = self.refs.iter().filter(|r| r.kind == RefKind::Local).map(|r| r.name.clone()).collect();
+            // Only a repository whose main line has an unusual name needs to ask which one it is.
+            let conventional = self.refs.iter().any(|r| r.kind != RefKind::Tag && TRUNKS.contains(&branch_short(r)));
+            self.default_branch = if conventional { None } else { repo.default_branch() };
             self.restore_sel = self.selected.as_ref().map(|c| c.hash.clone());
             self.commits.clear();
             self.graph = Graph::default();
@@ -653,6 +701,8 @@ impl GitApp {
             self.head_row = None;
             self.marks.clear();
             self.chain = None;
+            self.owners.clear();
+            self.lineage = None;
             self.log_rx = Some(git::stream_log(repo.root.clone(), hidden));
             self.loading = true;
             // Wait briefly for the first batch so the graph doesn't flash empty.
@@ -2348,8 +2398,123 @@ impl GitApp {
 
     // ---- graph ------------------------------------------------------------------------------
 
+    /// Branch tips in the order they claim shared history (see `Graph::owners`): trunks first,
+    /// local before remote, then every other branch, the oldest tip first, so a branch stacked
+    /// on another doesn't take over its base's commits. Also returns the trunk tips.
+    fn line_tips(&self) -> (Vec<usize>, Vec<(u32, usize)>) {
+        let mut tips: Vec<((usize, usize, usize), usize, Option<usize>)> = vec![];
+        for r in self.refs.iter().filter(|r| r.kind != RefKind::Tag && !self.hidden.contains(&ref_full(r))) {
+            let Some(&row) = self.hash_index.get(&r.target) else { continue };
+            let remote = r.kind == RefKind::Remote;
+            let trunk = self.trunk_rank(branch_short(r));
+            let key = match trunk {
+                Some(t) => (0, t, remote as usize),
+                None => (1, remote as usize, usize::MAX - row),
+            };
+            tips.push((key, row, trunk));
+        }
+        tips.sort();
+        let trunks = tips.iter().filter_map(|&(_, row, t)| Some((row as u32, t?))).collect();
+        (tips.into_iter().map(|t| t.1).collect(), trunks)
+    }
+
+    /// Where a branch name ranks among trunks: the remote's default branch (when it isn't called
+    /// anything in `TRUNKS`), then `TRUNKS` in order. None for every other branch.
+    fn trunk_rank(&self, short: &str) -> Option<usize> {
+        if self.default_branch.as_deref() == Some(short) {
+            return Some(0);
+        }
+        TRUNKS.iter().position(|t| *t == short).map(|i| i + 1)
+    }
+
+    /// The selected branch: the working copy means HEAD's; a commit some branch points at means
+    /// that branch; any other commit means the line it sits on.
+    fn lineage_tip(&self) -> Option<usize> {
+        match self.sel {
+            Sel::Wip => self.head_row,
+            Sel::Commit(_) => {
+                let i = self.sel_row()?;
+                let labeled = self.commits[i].refs.iter().any(|d| d != "HEAD" && !d.starts_with("tag: ") && !self.deco_hidden(d));
+                Some(if labeled { i } else { *self.owners.get(i)? as usize })
+            }
+        }
+    }
+
+    /// Keeps `lineage` in step with the selection and the loaded history.
+    fn update_lineage(&mut self) {
+        // While history streams in, rows are only appended and what is worked out stays valid,
+        // so catching up now and then is enough (a full pass per batch adds up on huge histories).
+        let due = !self.loading || self.owners.is_empty() || self.owners_at.elapsed() > Duration::from_millis(300);
+        if self.owners.len() != self.commits.len() && due {
+            let (tips, trunks) = self.line_tips();
+            self.owners = self.graph.owners(&tips);
+            self.owners_at = Instant::now();
+            self.trunks = trunks;
+            self.lineage = None;
+        }
+        let Some(tip) = self.lineage_tip().filter(|&t| t < self.graph.rows.len()) else {
+            self.lineage = None;
+            return;
+        };
+        if self.lineage.as_ref().is_some_and(|l| l.tip == tip) {
+            return;
+        }
+        let chain = self.graph.first_parent_chain(tip);
+        // The branch's own commits run until its line joins a trunk's (for a trunk: another
+        // trunk's; with no trunk known: any other line). Rows not worked out yet end it too.
+        let line = |r: u32| self.owners.get(r as usize).copied();
+        let trunk_of = |o: u32| self.trunks.iter().find(|t| t.0 == o).map(|t| t.1);
+        let tip_line = line(tip as u32);
+        let tip_trunk = tip_line.and_then(trunk_of);
+        let mine = |o: u32| match tip_trunk {
+            Some(rank) => trunk_of(o) == Some(rank),
+            None if self.trunks.is_empty() => Some(o) == tip_line,
+            None => trunk_of(o).is_none(),
+        };
+        let own = chain.iter().take_while(|&&r| line(r).is_some_and(&mine)).count().max(1);
+        let merges = self.graph.merged_into(&chain, &chain[..own]);
+        let color = theme::lane(self.graph.rows[tip].color as usize);
+        self.lineage = Some(Lineage { tip, color, chain, own, merges });
+    }
+
     fn lane_x(r: &Rect, lane: u16) -> f32 {
         r.x + 16.0 + lane as f32 * LANE_W
+    }
+
+    /// The selected branch's history over the muted graph: its first-parent line in one color
+    /// with a soft glow, plus the edges into the merges that took it into other branches.
+    fn draw_lineage(ui: &mut Ui, g: &Graph, l: &Lineage, list: &Rect, off: f32, first: usize, last: usize) {
+        let cy = |row: u32| list.y + (row as f32 + 1.5) * ROW_H - off;
+        let x = |row: u32| Self::lane_x(list, g.rows[row as usize].lane);
+        let (top, bottom) = (list.y - ROW_H, list.bottom() + ROW_H);
+        // The edge from child row `c` to parent row `p`, drawn only within `band`.
+        let edge = |ui: &mut Ui, c: u32, p: u32, band: (f32, f32), width: f32, soft: f32, color: Color| {
+            let (y0, y1) = (cy(c), cy(p));
+            if y1 < top || y0 > bottom {
+                return;
+            }
+            // Far-off parts are left out, which keeps coordinates small for long edges.
+            let (a, b) = if y0 + ROW_H < top { ((x(p), top), (x(p), top)) } else { ((x(c), y0), (x(p), y0 + ROW_H)) };
+            ui.p.edge(a, b, y1.min(bottom), band, width, soft, color);
+        };
+        // Chain edges that reach into view: from the last chain row above it to the first below.
+        let ch = &l.chain;
+        let lo = ch.partition_point(|&r| (r as usize) + 1 < first).saturating_sub(1);
+        let hi = ch.partition_point(|&r| (r as usize) < last).min(ch.len().saturating_sub(1));
+        let open = (-1e9, 1e9);
+        // The glow is translucent, so each edge keeps to its own rows: neighbours meet at a node
+        // without doubling up. The two ends stay open so the tip and root get round caps.
+        for k in lo..hi {
+            let y0 = if k == 0 { open.0 } else { cy(ch[k]) };
+            let y1 = if k + 2 == ch.len() { open.1 } else { cy(ch[k + 1]) };
+            edge(ui, ch[k], ch[k + 1], (y0, y1), 2.4, 6.0, l.color.alpha(0.32));
+        }
+        for &(m, p) in &l.merges {
+            edge(ui, m, p, open, 1.8, 0.0, l.color);
+        }
+        for k in lo..hi {
+            edge(ui, ch[k], ch[k + 1], open, 2.4, 0.0, l.color);
+        }
     }
 
     fn graph_view(&mut self, ui: &mut Ui, r: Rect) {
@@ -2369,6 +2534,7 @@ impl GitApp {
         let chain = self.rebase_chain();
         let sel_row = self.sel_row();
         let dragging = self.gdrag.as_ref().is_some_and(|g| g.active);
+        self.update_lineage();
 
         ui.p.push_clip(list);
         let mut clicked = None;
@@ -2379,6 +2545,10 @@ impl GitApp {
                 Sel::Commit(_) => sel_row.is_some_and(|c| i == c + 1),
             };
             let hov = ui.hovered(row) && self.drag == Drag::None && !dragging;
+            if let Some(l) = self.lineage.as_ref().filter(|l| i > 0 && l.merge_at(i - 1)) {
+                // A merge that took the selected branch into another one.
+                ui.p.rect(row, l.color.alpha(0.08));
+            }
             if selected {
                 ui.p.rect(row, theme::SELECT.alpha(0.75));
                 ui.p.rect(Rect::new(row.x, row.y, 2.0, row.h), theme::ACCENT);
@@ -2420,11 +2590,20 @@ impl GitApp {
                 y += 7.0;
             }
         }
+        // With a branch selected, everything off its line steps back.
+        let lin = self.lineage.as_ref();
+        let lane_color = |c: u16| {
+            let c = theme::lane(c as usize);
+            if lin.is_some() { c.mix(theme::BG, MUTED) } else { c }
+        };
         for i in first.saturating_sub(1).max(1)..last {
             let y = row_y(i) + ROW_H * 0.5;
             for s in &self.graph.rows[i - 1].segs {
-                ui.p.curve((Self::lane_x(&list, s.from), y), (Self::lane_x(&list, s.to), y + ROW_H), 1.8, theme::lane(s.color as usize));
+                ui.p.curve((Self::lane_x(&list, s.from), y), (Self::lane_x(&list, s.to), y + ROW_H), 1.8, lane_color(s.color));
             }
+        }
+        if let Some(l) = lin {
+            Self::draw_lineage(ui, &self.graph, l, &list, off, first, last);
         }
         // Nodes.
         for i in first..last {
@@ -2438,8 +2617,18 @@ impl GitApp {
             let c = &self.commits[i - 1];
             let g = &self.graph.rows[i - 1];
             let x = Self::lane_x(&list, g.lane);
-            let color = theme::lane(g.color as usize);
-            if c.is_head() {
+            let color = match lin {
+                Some(l) if l.has(i - 1) => l.color,
+                _ => lane_color(g.color),
+            };
+            if let Some(l) = lin.filter(|l| l.merge_at(i - 1)) {
+                // Where the selected branch was merged into another one: a glowing ring in its color.
+                ui.p.glow((x, cy), 5.0, 7.0, l.color.alpha(0.4));
+                let r = if c.is_head() { 7.0 } else { 5.5 };
+                ui.p.circle((x, cy), r, theme::BG);
+                ui.p.ring((x, cy), r, 2.0, l.color);
+                ui.p.circle((x, cy), if c.is_head() { 3.0 } else { 2.0 }, l.color);
+            } else if c.is_head() {
                 ui.p.circle((x, cy), 7.0, theme::BG);
                 ui.p.ring((x, cy), 7.0, 2.0, color);
                 ui.p.circle((x, cy), 3.0, color);
@@ -2508,7 +2697,10 @@ impl GitApp {
                 } else if let Some(t) = rf.strip_prefix("tag: ") {
                     (t, theme::YELLOW, theme::YELLOW, true)
                 } else if self.local_names.contains(rf.as_str()) {
-                    let lc = theme::lane(self.graph.rows[i - 1].color as usize);
+                    let lc = match &self.lineage {
+                        Some(l) if l.has(i - 1) => l.color,
+                        _ => theme::lane(self.graph.rows[i - 1].color as usize),
+                    };
                     (rf.as_str(), lc, lc.alpha(0.16), false)
                 } else {
                     (rf.as_str(), theme::CYAN.alpha(0.85), theme::CYAN, true)
@@ -2531,7 +2723,9 @@ impl GitApp {
                 }
                 x += pw + 6.0;
             }
-            let subject_color = if c.parents.len() > 1 { theme::DIM } else { theme::TEXT };
+            // Merges read dimmer, except those that took the selected branch somewhere.
+            let merged_here = self.lineage.as_ref().is_some_and(|l| l.merge_at(i - 1));
+            let subject_color = if c.parents.len() > 1 && !merged_here { theme::DIM } else { theme::TEXT };
             ui.p.text_fit(x, cy, max_x - x, UI, 13.0, &c.subject, subject_color);
             if show_meta {
                 let mx = list.right() - meta_w;
@@ -2660,6 +2854,21 @@ impl GitApp {
         let frac = |row: usize| r.y + (row as f32 + 0.5) / n.max(1) as f32 * r.h;
         for &(row, c) in &self.marks {
             ui.p.rect(Rect::new(r.x + 3.0, frac(row + 1) - 0.75, r.w - 6.0, 1.5), c);
+        }
+        if let Some(l) = &self.lineage {
+            // The selected branch: a quiet rail from its tip down to where it joins its base…
+            let (y0, y1) = (frac(l.chain[0] as usize + 1), frac(l.chain[l.own - 1] as usize + 1));
+            ui.p.rounded(Rect::new(r.x + 2.0, y0 - 1.5, 2.0, y1 - y0 + 3.0), 1.0, l.color.alpha(0.45));
+            // …and a glowing dot wherever it was merged into another branch (one per pixel row).
+            let mut prev = f32::MIN;
+            for &(m, _) in &l.merges {
+                let c = (r.x + r.w * 0.5, frac(m as usize + 1));
+                if c.1 - prev >= 1.0 {
+                    ui.p.glow(c, 3.0, 3.5, l.color.alpha(0.55));
+                    ui.p.circle(c, 3.0, l.color);
+                    prev = c.1;
+                }
+            }
         }
         if let Some(h) = self.head_row {
             ui.p.rounded(Rect::new(r.x + 2.0, frac(h + 1) - 1.5, r.w - 4.0, 3.0), 1.5, theme::TEXT);
@@ -4690,6 +4899,14 @@ fn added_worktrees(u: &Undo) -> Vec<PathBuf> {
     }
 }
 
+/// A branch's name without its remote (`origin/main` → `main`).
+fn branch_short(r: &Ref) -> &str {
+    match r.kind {
+        RefKind::Remote => r.name.split_once('/').map_or(r.name.as_str(), |(_, b)| b),
+        _ => r.name.as_str(),
+    }
+}
+
 /// Full ref name ("refs/heads/main", "refs/remotes/origin/main").
 fn ref_full(r: &Ref) -> String {
     match r.kind {
@@ -5142,6 +5359,93 @@ mod tests {
         assert_eq!(repo.last_message(), "mine");
         assert!(repo.is_ancestor("origin/main", "HEAD"));
         for d in [&dir, &up, &other] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn lineage_follows_the_selected_branch() {
+        // one ← two ← three ← M ← four (main); two ← f1 ← f2 (feature, merged at M).
+        let dir = temp_repo("lineage");
+        let git = |args: &[&str]| git::run(&dir, args, None).unwrap();
+        let commit = |name: &str| {
+            std::fs::write(dir.join(name), name).unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-qm", name]);
+        };
+        git(&["checkout", "-qb", "feature"]);
+        commit("f1");
+        commit("f2");
+        git(&["checkout", "-q", "main"]);
+        commit("three");
+        git(&["merge", "-q", "--no-ff", "feature", "-m", "Merge feature"]);
+        commit("four");
+        let mut h = Harness::new(&dir);
+        let row = |h: &Harness, rev: &str| h.app.hash_index[git(&["rev-parse", rev]).trim()];
+        let lineage = |h: &mut Harness, rev: &str| {
+            let hash = git(&["rev-parse", rev]).trim().to_string();
+            assert!(h.app.select_hash(&hash));
+            h.app.update_lineage();
+            let l = h.app.lineage.as_ref().unwrap();
+            (l.tip, l.chain.iter().map(|&r| r as usize).collect::<Vec<_>>(), l.own, l.merges.clone())
+        };
+
+        // A branch's tip: its whole first-parent history, and the merge that took it into main.
+        let (tip, chain, own, merges) = lineage(&mut h, "feature");
+        assert_eq!(tip, row(&h, "feature"));
+        assert_eq!(chain, ["feature", "feature~1", "main~3", "main~4"].map(|r| row(&h, r)));
+        assert_eq!(own, 2, "the feature's own commits end where it joins main");
+        assert_eq!(merges, vec![(row(&h, "main~1") as u32, row(&h, "feature") as u32)]);
+
+        // A commit no branch points at means the line it sits on.
+        assert_eq!(lineage(&mut h, "feature~1").0, row(&h, "feature"));
+        let (tip, chain, _, merges) = lineage(&mut h, "main~2");
+        assert_eq!(tip, row(&h, "main"), "main keeps its own line");
+        assert!(chain.contains(&row(&h, "main~1")) && !chain.contains(&row(&h, "feature")));
+        assert!(merges.is_empty());
+
+        // The working copy means HEAD's branch.
+        h.app.select(Sel::Wip);
+        h.app.update_lineage();
+        assert_eq!(h.app.lineage.as_ref().unwrap().tip, row(&h, "main"));
+
+        // Once the branch is deleted, its commits still form a line of their own.
+        let f2 = git(&["rev-parse", "feature"]);
+        git(&["branch", "-qD", "feature"]);
+        h.app.reload_all(true);
+        h.app.finish_loading();
+        let (tip, _, own, merges) = lineage(&mut h, &format!("{}~1", f2.trim()));
+        assert_eq!(tip, h.app.hash_index[f2.trim()]);
+        assert_eq!(own, 2);
+        assert_eq!(merges.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unusual_trunk_name_comes_from_origin_head() {
+        // production: one ← two ← three, plus a stale branch `old` at two. Without knowing that
+        // production is the main line, `old` (the older tip) would claim `one` for itself.
+        let dir = temp_repo("trunkname");
+        let git = |args: &[&str]| git::run(&dir, args, None).unwrap();
+        git(&["branch", "-qm", "main", "production"]);
+        git(&["branch", "old"]);
+        std::fs::write(dir.join("three"), "3").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "three"]);
+        let up = dir.with_file_name(format!("{}-up.git", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&up);
+        git(&["init", "-q", "--bare", up.to_str().unwrap()]);
+        git(&["remote", "add", "origin", up.to_str().unwrap()]);
+        git(&["push", "-q", "origin", "production"]);
+        git(&["remote", "set-head", "origin", "production"]);
+        let mut h = Harness::new(&dir);
+        assert_eq!(h.app.default_branch.as_deref(), Some("production"));
+        let one = git(&["rev-parse", "production~2"]);
+        assert!(h.app.select_hash(one.trim()));
+        h.app.update_lineage();
+        let tip = git(&["rev-parse", "production"]);
+        assert_eq!(h.app.lineage.as_ref().unwrap().tip, h.app.hash_index[tip.trim()]);
+        for d in [&dir, &up] {
             let _ = std::fs::remove_dir_all(d);
         }
     }

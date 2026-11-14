@@ -407,6 +407,13 @@ impl Repo {
         Ok(refs)
     }
 
+    /// The branch `origin/HEAD` points at (the remote's default branch), without the remote.
+    pub fn default_branch(&self) -> Option<String> {
+        let s = self.git(&["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"]).ok()?;
+        let s = s.trim();
+        Some(s.split_once('/').map_or(s, |(_, b)| b).to_string()).filter(|b| !b.is_empty())
+    }
+
     pub fn head_name(&self) -> String {
         self.git(&["symbolic-ref", "--short", "-q", "HEAD"])
             .map(|s| s.trim().to_string())

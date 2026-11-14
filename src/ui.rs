@@ -131,16 +131,18 @@ const MODE_SOLID: f32 = 0.0;
 const MODE_GLYPH: f32 = 1.0;
 const MODE_RRECT: f32 = 2.0;
 const MODE_CAPSULE: f32 = 3.0;
+const MODE_EDGE: f32 = 4.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Vertex {
     pub pos: [f32; 2],
+    /// glyph: atlas coordinates  |  edge: the drawn band, top and bottom y
     pub uv: [f32; 2],
     pub color: [f32; 4],
-    /// rrect: center.xy, half-size.wh  |  capsule: a.xy, b.xy
+    /// rrect: center.xy, half-size.wh  |  capsule: a.xy, b.xy  |  edge: curve start.xy, end.xy
     pub shape: [f32; 4],
-    /// mode, radius, stroke width, unused
+    /// mode, radius, stroke width (rrect) or softness (capsule, edge), edge: tail end y
     pub params: [f32; 4],
 }
 
@@ -268,6 +270,29 @@ impl Painter {
             [a.0 - ux * e - nx * e, a.1 - uy * e - ny * e],
         ];
         self.quad(p, [[0.0; 2]; 4], c, [a.0, a.1, b.0, b.1], [MODE_CAPSULE, r, 0.0, 0.0]);
+    }
+
+    /// A soft round glow: solid out to `radius`, then fading to nothing over `soft` pixels.
+    pub fn glow(&mut self, (x, y): (f32, f32), radius: f32, soft: f32, c: Color) {
+        let e = radius + soft + 1.0;
+        let r = Rect::new(x - e, y - e, 2.0 * e, 2.0 * e);
+        self.quad(Self::corners(r), [[0.0; 2]; 4], c, [x, y, x, y], [MODE_CAPSULE, radius, soft.max(0.0), 0.0]);
+    }
+
+    /// A graph edge as one shape: an S-curve from `a` into `b` (in the row below), then straight
+    /// down to `end_y`. Only `band.0 <= y < band.1` is drawn, so consecutive edges of a path can
+    /// meet without overlapping and a translucent glow along them stays even. `soft` > 0 fades
+    /// the outside out over that many pixels (a glow) instead of anti-aliasing it.
+    pub fn edge(&mut self, a: (f32, f32), b: (f32, f32), end_y: f32, band: (f32, f32), width: f32, soft: f32, c: Color) {
+        let r = width * 0.5;
+        let e = r + soft.max(0.0) + 1.0;
+        let end = end_y.max(b.1);
+        let (y0, y1) = ((a.1 - e).max(band.0), (end + e).min(band.1));
+        if y1 <= y0 {
+            return;
+        }
+        let q = Rect::new(a.0.min(b.0) - e, y0, (a.0 - b.0).abs() + 2.0 * e, y1 - y0);
+        self.quad(Self::corners(q), [[band.0, band.1]; 4], c, [a.0, a.1, b.0, b.1], [MODE_EDGE, r, soft.max(0.0), end]);
     }
 
     /// Vertical S-curve between two points (used for graph edges that change lanes).
