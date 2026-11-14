@@ -1,14 +1,17 @@
 //! Tabs: several repositories open at once, each a full `GitApp` with its own state.
-//! The open tabs and recently used repositories are remembered between launches.
+//! The open tabs and recently used repositories are remembered between launches. Opening a
+//! repository never holds up the window: worker threads read it (at startup the visible tab's
+//! first), and its tab fills in when the read comes back.
 
-use crate::app::GitApp;
+use crate::app::{self, GitApp, Opened};
 use crate::chrome;
 use crate::config::{self, Config};
 use crate::font::UI;
 use crate::git::Repo;
 use crate::ui::{bind, theme, Color, Cursor, Rect, Ui};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 pub const TAB_H: f32 = 36.0;
@@ -20,6 +23,84 @@ struct TabDrag {
     index: usize,
     start_x: f32,
     active: bool,
+}
+
+/// Threads reading repositories for tabs, at most.
+const READERS: usize = 2;
+
+/// A repository for a reader to read, and whether to say so if that fails (a tab restored
+/// from the last session whose repository is gone just closes).
+struct Job {
+    path: PathBuf,
+    report: bool,
+}
+
+#[derive(Default)]
+struct Queue {
+    jobs: VecDeque<Job>,
+    readers: usize,
+}
+
+/// Reads tabs' repositories on worker threads, in the order queued (a tab that's switched to
+/// meanwhile goes to the front). Readers start when there's work and stop when there's none.
+struct Loader {
+    queue: Arc<Mutex<Queue>>,
+    tx: mpsc::Sender<(Job, Result<Opened, String>)>,
+    rx: mpsc::Receiver<(Job, Result<Opened, String>)>,
+}
+
+impl Loader {
+    fn new() -> Loader {
+        let (tx, rx) = mpsc::channel();
+        Loader { queue: Arc::default(), tx, rx }
+    }
+
+    fn lock(queue: &Mutex<Queue>) -> std::sync::MutexGuard<'_, Queue> {
+        queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Queues a repository (once), starting a reader if fewer than `READERS` are at work.
+    fn read(&self, path: PathBuf, report: bool) {
+        let mut q = Self::lock(&self.queue);
+        if q.jobs.iter().any(|j| j.path == path) {
+            return;
+        }
+        q.jobs.push_back(Job { path, report });
+        if q.readers >= READERS {
+            return;
+        }
+        q.readers += 1;
+        let (queue, tx) = (self.queue.clone(), self.tx.clone());
+        std::thread::spawn(move || loop {
+            let job = {
+                let mut q = Self::lock(&queue);
+                match q.jobs.pop_front() {
+                    Some(j) => j,
+                    None => {
+                        q.readers -= 1;
+                        return;
+                    }
+                }
+            };
+            // A read that panics fails like one git refuses, instead of leaving its tab waiting.
+            let read = std::panic::catch_unwind(|| app::read_repo(&job.path)).unwrap_or_else(|_| Err("reading it failed".into()));
+            if tx.send((job, read)).is_err() {
+                return;
+            }
+        });
+    }
+
+    /// Reads this one next, if it's still waiting.
+    fn hurry(&self, path: &Path) {
+        let mut q = Self::lock(&self.queue);
+        if let Some(j) = q.jobs.iter().position(|j| j.path == path).and_then(|i| q.jobs.remove(i)) {
+            q.jobs.push_front(j);
+        }
+    }
+
+    fn forget(&self, path: &Path) {
+        Self::lock(&self.queue).jobs.retain(|j| j.path != path);
+    }
 }
 
 pub struct Workspace {
@@ -36,32 +117,90 @@ pub struct Workspace {
     error: Option<String>,
     /// The settings file (only read and written when `persist`; else the defaults).
     config: Config,
+    /// Tabs' repositories, being read.
+    loader: Loader,
 }
 
 impl Workspace {
-    /// Restores the previous session, then opens `arg` (if any) in a tab and focuses it.
+    /// Restores the previous session, then opens `arg` (if any) in a tab and focuses it. The
+    /// repositories are read in the background: this returns right away.
     pub fn new(arg: Option<PathBuf>) -> Self {
-        let mut ws = Self::empty(true);
-        ws.config = config::load();
         let (tabs, active, recent) = load_session();
-        ws.recent = recent;
-        for p in tabs {
-            ws.add_tab(&p, false, true);
+        let mut ws = Self::restore(tabs, active, recent, true);
+        ws.config = config::load();
+        let open = match arg {
+            Some(p) => Some(p),
+            None if ws.tabs.is_empty() => std::env::current_dir().ok().filter(|cwd| Repo::open(cwd).is_ok()),
+            None => None,
+        };
+        if let Some(i) = open.and_then(|p| ws.add_tab(&p, true, false)) {
+            ws.active = i;
         }
-        ws.active = active.min(ws.tabs.len().saturating_sub(1));
-        match arg {
-            Some(p) => ws.open_tab(&p),
-            None if ws.tabs.is_empty() => {
-                if let Ok(cwd) = std::env::current_dir() {
-                    if Repo::open(&cwd).is_ok() {
-                        ws.open_tab(&cwd);
-                    }
-                }
-            }
-            None => {}
-        }
+        ws.start_loading();
         ws.save();
         ws
+    }
+
+    /// A saved session's tabs, each still to read its repository (`start_loading`).
+    fn restore(tabs: Vec<PathBuf>, active: usize, recent: Vec<PathBuf>, persist: bool) -> Self {
+        let mut ws = Self::empty(persist);
+        ws.recent = recent;
+        for p in tabs {
+            if ws.tabs.iter().any(|t| t.root().as_ref() == Some(&p)) {
+                continue;
+            }
+            ws.touch_recent(&p);
+            let mut app = GitApp::pending(p);
+            app.in_tab = true;
+            ws.tabs.push(app);
+        }
+        ws.active = active.min(ws.tabs.len().saturating_sub(1));
+        ws
+    }
+
+    /// Starts reading the restored tabs' repositories: the visible one first, then outwards.
+    fn start_loading(&mut self) {
+        let mut waiting: Vec<usize> = (0..self.tabs.len()).filter(|&i| self.tabs[i].pending_path().is_some()).collect();
+        waiting.sort_by_key(|&i| i.abs_diff(self.active));
+        for i in waiting {
+            if let Some(p) = self.tabs[i].pending_path() {
+                self.loader.read(p.to_path_buf(), false);
+            }
+        }
+    }
+
+    /// Shows the tabs whose repositories have been read.
+    fn take_loaded(&mut self, ui: &mut Ui) {
+        while let Ok((job, read)) = self.loader.rx.try_recv() {
+            self.loaded(job, read);
+        }
+        if self.tabs.iter().any(|t| t.pending_path().is_some()) {
+            ui.wake_in(Duration::from_millis(30));
+        }
+    }
+
+    /// Waits until every tab has its repository (screenshots, tests).
+    fn finish_loading(&mut self) {
+        while self.tabs.iter().any(|t| t.pending_path().is_some()) {
+            match self.loader.rx.recv_timeout(Duration::from_secs(60)) {
+                Ok((job, read)) => self.loaded(job, read),
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// A repository read for a tab: shown, or (couldn't be read) the tab closes.
+    fn loaded(&mut self, job: Job, read: Result<Opened, String>) {
+        let Some(i) = self.tabs.iter().position(|t| t.pending_path() == Some(job.path.as_path())) else { return };
+        match read {
+            Ok(o) => self.tabs[i].opened(o),
+            Err(e) => {
+                self.close(i);
+                if job.report {
+                    self.error = Some(format!("Couldn't open {} ({})", tilde(&job.path), e.lines().next().unwrap_or("")));
+                }
+            }
+        }
     }
 
     /// Opens exactly these repositories without touching the saved session (screenshots, tests).
@@ -70,6 +209,7 @@ impl Workspace {
         for p in paths {
             ws.open_tab(p);
         }
+        ws.finish_loading();
         ws
     }
 
@@ -86,6 +226,7 @@ impl Workspace {
             drag: None,
             error: None,
             config: Config::default(),
+            loader: Loader::new(),
         }
     }
 
@@ -115,6 +256,8 @@ impl Workspace {
         self.save();
     }
 
+    /// A tab for the repository at `path` (or the one already open there): after the active
+    /// tab, or at the end. It reads the repository in the background.
     fn add_tab(&mut self, path: &Path, report: bool, append: bool) -> Option<usize> {
         let repo = match Repo::open(path) {
             Ok(r) => r,
@@ -130,7 +273,8 @@ impl Workspace {
         if let Some(i) = self.tabs.iter().position(|t| t.root().as_ref() == Some(&root)) {
             return Some(i);
         }
-        let mut app = GitApp::new(Some(root));
+        self.loader.read(root.clone(), true);
+        let mut app = GitApp::pending(root);
         app.in_tab = true;
         let at = if self.tabs.is_empty() || append { self.tabs.len() } else { self.active + 1 };
         self.tabs.insert(at, app);
@@ -148,6 +292,9 @@ impl Workspace {
 
     fn activate(&mut self, i: usize) {
         if i < self.tabs.len() {
+            if let Some(p) = self.tabs[i].pending_path() {
+                self.loader.hurry(p);
+            }
             if i != self.active {
                 self.active = i;
                 self.tabs[i].on_focus();
@@ -160,12 +307,19 @@ impl Workspace {
         if i >= self.tabs.len() {
             return;
         }
+        if let Some(p) = self.tabs[i].pending_path() {
+            self.loader.forget(p);
+        }
         self.tabs.remove(i);
+        let was_active = i == self.active;
         if self.active > i || self.active >= self.tabs.len() {
             self.active = self.active.saturating_sub(1);
         }
-        if let Some(t) = self.tabs.get_mut(self.active) {
-            t.on_focus();
+        // The tab that comes into view catches up (closing one behind it changes nothing here).
+        if was_active {
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                t.on_focus();
+            }
         }
         self.save();
     }
@@ -192,6 +346,7 @@ impl Workspace {
     // ---- frame ------------------------------------------------------------------------
 
     pub fn frame(&mut self, ui: &mut Ui) {
+        self.take_loaded(ui);
         if let Some(rx) = &self.picker {
             match rx.try_recv() {
                 Ok(Some(p)) => {
@@ -723,6 +878,62 @@ mod tests {
         assert_eq!(ws.tabs[ws.active].root(), Some(b.clone()), "focus stays where it was");
         assert!(ws.tabs.iter().any(|t| t.root() == Some(c.clone())));
         for d in [&a, &b, &c] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn restored_tabs_read_their_repositories_in_the_background() {
+        let (a, b) = (repo("ra"), repo("rb"));
+        std::fs::write(b.join("f"), "changed").unwrap();
+        let gone = std::env::temp_dir().join(format!("wgitpui-ws-gone-{}", std::process::id()));
+        // No git at all yet: every tab is waiting, and they're all part of the session.
+        let mut ws = Workspace::restore(vec![a.clone(), gone.clone(), b.clone()], 2, vec![], false);
+        assert!(ws.tabs.iter().all(|t| t.pending_path().is_some()));
+        assert_eq!(ws.tabs.iter().filter_map(GitApp::root).collect::<Vec<_>>(), [a.clone(), gone.clone(), b.clone()]);
+        assert_eq!(ws.tabs[2].tab_info().1, "opening…");
+        ws.start_loading();
+        let mut ui = Ui::new(crate::font::Fonts::load().unwrap());
+        let t = std::time::Instant::now();
+        while ws.tabs.iter().any(|t| t.pending_path().is_some()) && t.elapsed() < Duration::from_secs(20) {
+            frame(&mut ws, &mut ui);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The missing one is gone; the others show their repositories, the same tab active.
+        assert_eq!(ws.tabs.iter().filter_map(GitApp::root).collect::<Vec<_>>(), [a.clone(), b.clone()]);
+        assert_eq!(ws.active, 1);
+        assert!(ws.tabs.iter().all(|t| t.pending_path().is_none()));
+        let (name, branch, changes, _) = ws.tabs[1].tab_info();
+        assert_eq!((branch.as_str(), changes), ("main", 1), "{name}");
+        ws.activate(0);
+        frame(&mut ws, &mut ui);
+        assert!(ws.title().starts_with("wgitpui-ws-ra"), "{}", ws.title());
+        for d in [&a, &b] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn opening_a_tab_reads_its_repository_in_the_background() {
+        let (a, b) = (repo("oa"), repo("ob"));
+        let mut ws = Workspace::for_paths(&[a.clone()]);
+        let mut ui = Ui::new(crate::font::Fonts::load().unwrap());
+        frame(&mut ws, &mut ui);
+        // The tab is there (and focused) at once; its repository comes after.
+        ws.open_tab(&b);
+        assert_eq!((ws.tabs.len(), ws.active), (2, 1));
+        assert_eq!(ws.tabs[1].pending_path(), Some(b.as_path()));
+        let t = std::time::Instant::now();
+        while ws.tabs[1].pending_path().is_some() && t.elapsed() < Duration::from_secs(20) {
+            frame(&mut ws, &mut ui);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(ws.tabs[1].tab_info().1, "main");
+        // Opening it again while it's open (or still being read) switches to it.
+        ws.open_tab(&a);
+        ws.open_tab(&b);
+        assert_eq!((ws.tabs.len(), ws.active), (2, 1));
+        for d in [&a, &b] {
             let _ = std::fs::remove_dir_all(d);
         }
     }

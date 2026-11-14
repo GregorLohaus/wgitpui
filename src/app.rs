@@ -10,6 +10,8 @@ use crate::graph::Graph;
 use crate::keys::{self, Cmd, Pane};
 
 mod keyboard;
+mod load;
+pub use load::{read_repo, Opened};
 use crate::palette::{fuzzy, Act, Item, Palette, WtFrom};
 use crate::rebase::{self, ChainItem, RebaseOp};
 use crate::resolve::{ConflictDoc, ResolveAction};
@@ -392,11 +394,21 @@ pub struct GitApp {
     stash_view: Option<String>,
     /// Keys to press at the start of the next frame (key bar and `?` clicks).
     pending_keys: Vec<&'static str>,
+    /// A tab restored at startup whose repository is still being read in the background.
+    pending: Option<PathBuf>,
+    /// Opened with nothing to commit: HEAD's commit gets selected once the history has it.
+    select_head: bool,
+    /// A refresh being read in the background (the window or tab came back into view).
+    refresh: Option<load::Refresh>,
+    /// How many times everything, and the working copy alone, were reloaded: a refresh read in
+    /// the background is only taken in if nothing newer came in meanwhile.
+    full_gen: u64,
+    status_gen: u64,
 }
 
 impl GitApp {
-    pub fn new(path: Option<PathBuf>) -> Self {
-        let mut app = GitApp {
+    fn blank() -> Self {
+        GitApp {
             repo: None,
             commits: vec![],
             graph: Graph::default(),
@@ -477,46 +489,38 @@ impl GitApp {
             stashes: vec![],
             stash_view: None,
             pending_keys: vec![],
-        };
-        let path = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        app.open(path);
+            pending: None,
+            select_head: false,
+            refresh: None,
+            full_gen: 0,
+            status_gen: 0,
+        }
+    }
+
+    /// Opens the repository at `path` (or the current directory) right away. Tests do; the
+    /// app's tabs read theirs in the background (`pending`, then `opened`).
+    #[cfg(test)]
+    pub fn new(path: Option<PathBuf>) -> Self {
+        let mut app = Self::blank();
+        app.open(path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default()));
         app
+    }
+
+    /// A tab for a repository that's being read in the background; `opened` shows it.
+    pub fn pending(path: PathBuf) -> Self {
+        let mut app = Self::blank();
+        app.pending = Some(path);
+        app
+    }
+
+    pub fn pending_path(&self) -> Option<&Path> {
+        self.pending.as_deref()
     }
 
     pub fn title(&self) -> String {
         match &self.repo {
             Some(r) => format!("{} — {} · wgitpui", r.name(), self.head_name),
             None => "wgitpui".into(),
-        }
-    }
-
-    fn open(&mut self, path: PathBuf) {
-        match Repo::open(&path) {
-            Ok(repo) => {
-                self.hidden = repo.hidden_refs().into_iter().collect();
-                self.repo = Some(repo);
-                self.sel = Sel::Wip;
-                self.selected = None;
-                self.wip_file = None;
-                self.file_view = None;
-                self.undo.clear();
-                self.tree = TreeView::default();
-                self.graph_scroll = Scroll::default();
-                self.reload_all(true);
-                if self.changes.is_empty() {
-                    if let Some(h) = self.head_row {
-                        self.select(Sel::Commit(h));
-                    }
-                }
-                // Like lazygit: the files when there are changes, else the commits.
-                self.pane = if self.sel == Sel::Wip { Pane::Files } else { Pane::Commits };
-                self.copied.clear();
-            }
-            Err(e) => {
-                if self.repo.is_some() {
-                    self.toast_err(format!("{}: {e}", path.display()));
-                }
-            }
         }
     }
 
@@ -584,12 +588,6 @@ impl GitApp {
             "pull" => self.open_pull_menu(at),
             "fetch" => self.open_fetch_menu(at),
             _ => self.open_push_menu(at),
-        }
-    }
-
-    pub fn on_focus(&mut self) {
-        if self.job.is_none() {
-            self.reload_all(false);
         }
     }
 
@@ -795,63 +793,6 @@ impl GitApp {
 
     // ---- loading ----------------------------------------------------------------------------
 
-    /// Reloads refs + status. History is only re-streamed when a ref or HEAD actually moved,
-    /// so focus-triggered refreshes on huge repositories stay cheap.
-    fn reload_all(&mut self, force: bool) {
-        let Some(repo) = &self.repo else { return };
-        let head_name = repo.head_name();
-        let mut hidden: Vec<String> = self.hidden.iter().cloned().collect();
-        hidden.sort();
-        let sig = format!("{}\n{head_name}\n{}", repo.refs_signature(), hidden.join(","));
-        if force || sig != self.refs_sig {
-            self.refs_sig = sig;
-            self.head_name = head_name;
-            self.refs = repo.refs().unwrap_or_default();
-            self.local_names = self.refs.iter().filter(|r| r.kind == RefKind::Local).map(|r| r.name.clone()).collect();
-            // Only a repository whose main line has an unusual name needs to ask which one it is.
-            let conventional = self.refs.iter().any(|r| r.kind != RefKind::Tag && TRUNKS.contains(&branch_short(r)));
-            self.default_branch = if conventional { None } else { repo.default_branch() };
-            self.restore_sel = self.selected.as_ref().map(|c| c.hash.clone());
-            self.commits.clear();
-            self.graph = Graph::default();
-            self.hash_index.clear();
-            self.head_row = None;
-            self.marks.clear();
-            self.chain = None;
-            self.owners.clear();
-            self.lineage = None;
-            self.log_rx = Some(git::stream_log(repo.root.clone(), hidden));
-            self.loading = true;
-            // Wait briefly for the first batch so the graph doesn't flash empty.
-            self.drain_log(Some(Duration::from_millis(400)));
-        }
-        if let Some(repo) = &self.repo {
-            self.op = repo.op_in_progress();
-            self.stashes = repo.stashes();
-        }
-        if self.stash_view.as_ref().is_some_and(|h| !self.stashes.iter().any(|s| &s.hash == h)) {
-            self.close_stash();
-        }
-        self.reload_status();
-        self.reload_worktrees();
-    }
-
-    /// Lists the repository's working trees and counts the changes in each of the others.
-    fn reload_worktrees(&mut self) {
-        let Some(repo) = &self.repo else { return };
-        let mut wts = repo.worktrees();
-        for w in &mut wts {
-            w.changes = if git::same_path(&w.path, &repo.root) {
-                self.changes.len()
-            } else if w.bare || w.prunable || self.wt_jobs.iter().any(|j| j.wt.path == w.path) {
-                0
-            } else {
-                git::change_count(&w.path)
-            };
-        }
-        self.worktrees = wts;
-    }
-
     fn is_current_wt(&self, w: &Worktree) -> bool {
         self.repo.as_ref().is_some_and(|r| git::same_path(&w.path, &r.root))
     }
@@ -930,6 +871,11 @@ impl GitApp {
         while let Ok(m) = rx.try_recv() {
             msgs.push(m);
         }
+        self.take_log(msgs);
+    }
+
+    /// Takes in what the history stream sent.
+    fn take_log(&mut self, msgs: Vec<LogMsg>) {
         if msgs.is_empty() {
             return;
         }
@@ -982,54 +928,6 @@ impl GitApp {
                 }
             }
         }
-    }
-
-    fn reload_status(&mut self) {
-        let Some(repo) = &self.repo else { return };
-        match repo.status() {
-            Ok(c) => self.changes = c,
-            Err(e) => self.toast_err(e),
-        }
-        self.load_wip_trees();
-        let valid = self.wip_file.as_ref().is_some_and(|(p, staged)| {
-            self.changes.iter().any(|c| &c.path == p && if *staged { c.staged() } else { c.unstaged() })
-        });
-        if !valid {
-            // The top of the lists: a conflict, else the first unstaged file, else staged.
-            let conflict = self.changes.iter().find(|c| c.conflicted()).map(|c| (c.path.clone(), false));
-            let unstaged = self.unstaged_tree.first_file().map(|p| (p.to_string(), false));
-            let staged = self.staged_tree.first_file().map(|p| (p.to_string(), true));
-            self.wip_file = conflict.or(unstaged).or(staged);
-        }
-        if self.showing_wip() {
-            self.load_wip_diff();
-        }
-    }
-
-    /// The working copy's two file trees, with the lines each file adds and removes.
-    fn load_wip_trees(&mut self) {
-        let Some(repo) = &self.repo else { return };
-        let (unstaged, staged) = (repo.numstat(false), repo.numstat(true));
-        let mut budget = 64_000_000;
-        let mut entries = |staged_side: bool| -> Vec<Entry> {
-            self.changes
-                .iter()
-                .filter(|c| !c.conflicted() && if staged_side { c.staged() } else { c.unstaged() })
-                .map(|c| {
-                    let stats = if staged_side { staged.get(&c.path) } else { unstaged.get(&c.path) };
-                    let (adds, dels) = match stats {
-                        Some(&s) => s,
-                        None if c.untracked() => (git::line_count(&repo.root.join(&c.path), &mut budget), 0),
-                        None => (0, 0),
-                    };
-                    let from = c.orig.clone().filter(|_| staged_side);
-                    Entry { path: c.path.clone(), from, badge: status_badge(if staged_side { c.x } else { c.y }), adds, dels }
-                })
-                .collect()
-        };
-        let (u, s) = (entries(false), entries(true));
-        self.unstaged_tree.set(u);
-        self.staged_tree.set(s);
     }
 
     /// The changes tree follows the diff on screen (a commit's, stash's, comparison's).
@@ -1234,6 +1132,7 @@ impl GitApp {
 
     fn select(&mut self, sel: Sel) {
         self.sel = sel;
+        self.select_head = false;
         self.stash_view = None;
         match sel {
             Sel::Wip => {
@@ -2324,6 +2223,7 @@ impl GitApp {
 
     /// Keeps background work moving while this repository's tab isn't visible.
     pub fn background(&mut self, ui: &mut Ui) {
+        self.take_refresh(ui);
         self.drain_log(None);
         if self.loading {
             ui.wake_in(Duration::from_millis(60));
@@ -2334,17 +2234,27 @@ impl GitApp {
 
     /// (repo name, branch, number of changed files, operation in progress / conflicts)
     pub fn tab_info(&self) -> (String, String, usize, bool) {
+        if let Some(p) = &self.pending {
+            return (load::dir_name(p), "opening…".into(), 0, false);
+        }
         let name = self.repo.as_ref().map_or_else(|| "—".into(), |r| r.name());
         let busy = self.op.is_some() || self.changes.iter().any(|c| c.conflicted());
         (name, self.head_name.clone(), self.changes.len(), busy)
     }
 
+    /// The repository's folder (a tab still reading it: the folder it was restored with).
     pub fn root(&self) -> Option<PathBuf> {
-        self.repo.as_ref().map(|r| r.root.clone())
+        self.repo.as_ref().map(|r| r.root.clone()).or_else(|| self.pending.clone())
     }
 
     pub fn frame_in(&mut self, ui: &mut Ui, bounds: Rect) {
+        if self.pending.is_some() {
+            self.draw_pending(ui, bounds);
+            return;
+        }
+        self.take_refresh(ui);
         self.drain_log(None);
+        self.pick_head();
         if self.loading {
             ui.wake_in(Duration::from_millis(30));
         }
@@ -5937,6 +5847,16 @@ mod tests {
                 self.frame();
             }
         }
+        /// What coming back to the window does: a refresh read in the background, taken in.
+        fn refresh(&mut self) {
+            self.app.on_focus();
+            let t = Instant::now();
+            while self.app.refresh.is_some() && t.elapsed() < Duration::from_secs(20) {
+                std::thread::sleep(Duration::from_millis(5));
+                self.frame();
+            }
+            assert!(self.app.refresh.is_none(), "the refresh never came back");
+        }
         fn menu_labels(&self) -> Vec<String> {
             self.app.menu.as_ref().expect("menu open").items.iter().filter(|i| i.act.is_some()).map(|i| i.label.clone()).collect()
         }
@@ -6099,7 +6019,7 @@ mod tests {
         h.app.apply_diff_action(DiffAction::Hunk { f: 0, h: 0, discard: false });
         assert_eq!(h.app.diff.files[0].hunks.len(), 1);
         assert_eq!(h.app.diff.selected, HashSet::from([at(&h, 0, "+line 35 changed")]));
-        h.app.on_focus();
+        h.refresh();
         assert_eq!(h.app.diff.selected.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6820,6 +6740,80 @@ mod tests {
         assert_eq!(h.app.changes_tree.rows().len(), 5, "lib/deep/ closed");
         h.keys("h h");
         assert_eq!(h.app.changes_tree.rows().len(), 3, "then lib/");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_repository_read_in_the_background_opens_like_any_other() {
+        let dir = temp_repo("bg-open");
+        let clean = GitApp::new(Some(dir.clone()));
+        // What a worker thread reads, handed over to a waiting tab.
+        let read = std::thread::spawn({
+            let dir = dir.clone();
+            move || read_repo(&dir)
+        });
+        let mut h = Harness { app: GitApp::pending(dir.clone()), ui: Ui::new(crate::font::Fonts::load().unwrap()) };
+        h.frame();
+        assert!(h.app.repo.is_none() && h.app.root() == Some(dir.clone()));
+        h.app.opened(read.join().unwrap().unwrap());
+        assert!(h.app.pending_path().is_none());
+        // Shown, it lands where opening it directly does: nothing to commit, so on the latest
+        // commit, with the commits pane in charge.
+        h.app.finish_loading();
+        h.frame();
+        assert_eq!((h.app.sel_row(), h.app.pane), (clean.sel_row(), clean.pane));
+        assert_eq!(h.app.sel_row(), Some(0));
+        assert_eq!(h.app.head_name, clean.head_name);
+        assert_eq!(h.app.commits.len(), 2);
+        // With changes it opens on them.
+        std::fs::write(dir.join("one"), "changed").unwrap();
+        h.app.opened(read_repo(&dir).unwrap());
+        h.app.finish_loading();
+        h.frame();
+        assert!(h.app.sel == Sel::Wip && h.app.pane == Pane::Files);
+        assert_eq!(h.app.wip_file, Some(("one".to_string(), false)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn coming_back_refreshes_in_the_background_without_undoing_newer_work() {
+        let dir = temp_repo("bg-refresh");
+        let git = |args: &[&str]| git::run(&dir, args, None).unwrap();
+        let mut h = Harness::new(&dir);
+        assert_eq!((h.app.commits.len(), h.app.changes.len()), (2, 0));
+        // Meanwhile, in a terminal: a commit, and an edit.
+        std::fs::write(dir.join("three"), "3").unwrap();
+        git(&["add", "three"]);
+        git(&["commit", "-qm", "three"]);
+        std::fs::write(dir.join("one"), "one, changed").unwrap();
+        // Coming back doesn't wait for git: nothing has changed yet, then it all comes in.
+        h.app.on_focus();
+        assert_eq!(h.app.commits.len(), 2);
+        h.refresh();
+        h.app.finish_loading();
+        assert_eq!(h.app.commits.len(), 3);
+        assert_eq!(h.app.changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), ["one"]);
+        assert!(h.app.head_name == "main" && h.app.commits[0].subject == "three");
+
+        // A refresh read before the app staged a file doesn't unstage it again...
+        h.app.on_focus();
+        h.app.refresh_read();
+        h.app.stage_paths(&["one".to_string()], true);
+        h.frame();
+        assert!(h.app.refresh.is_none());
+        assert!(h.app.changes.iter().any(|c| c.path == "one" && c.staged() && !c.unstaged()));
+        assert!(h.app.staged_tree.row_of("one").is_some() && h.app.unstaged_tree.rows().is_empty());
+        // ...and one read before the app reloaded everything (it committed) is old news, history
+        // and all.
+        git(&["commit", "-qm", "four"]);
+        h.app.on_focus();
+        h.app.refresh_read();
+        std::fs::write(dir.join("two"), "two, changed").unwrap();
+        git(&["commit", "-qam", "five"]);
+        h.app.reload_all(false);
+        h.frame();
+        h.app.finish_loading();
+        assert_eq!((h.app.commits.len(), h.app.commits[0].subject.as_str(), h.app.changes.len()), (5, "five", 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

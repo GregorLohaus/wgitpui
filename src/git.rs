@@ -378,6 +378,7 @@ impl DiffOpts {
     }
 }
 
+#[derive(Clone)]
 pub struct Repo {
     pub root: PathBuf,
 }
