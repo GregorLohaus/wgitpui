@@ -272,6 +272,49 @@ pub struct Ref {
     pub gone: bool,
 }
 
+/// One `git stash` entry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stash {
+    /// Its reflog name, "stash@{0}" (changes as stashes come and go; `hash` doesn't).
+    pub name: String,
+    pub hash: String,
+    /// "On main: message", or git's own "WIP on main: 1a2b3c4 last commit's subject".
+    pub subject: String,
+    pub time: i64,
+}
+
+impl Stash {
+    /// The branch it was made on, and its message.
+    pub fn parts(&self) -> (&str, &str) {
+        let s = self.subject.strip_prefix("WIP on ").or_else(|| self.subject.strip_prefix("On ")).unwrap_or(&self.subject);
+        s.split_once(": ").unwrap_or(("", s))
+    }
+}
+
+/// What `git stash push` puts away.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StashKind {
+    /// Staged and unstaged changes to tracked files (git's default).
+    Changes,
+    /// Those, plus untracked files.
+    WithUntracked,
+    /// Only what's staged.
+    Staged,
+    /// Everything, but the staged changes stay in the index and the files too.
+    KeepIndex,
+}
+
+impl StashKind {
+    pub fn what(self) -> &'static str {
+        match self {
+            StashKind::Changes => "all changes",
+            StashKind::WithUntracked => "all changes and untracked files",
+            StashKind::Staged => "staged changes",
+            StashKind::KeepIndex => "all changes, keeping what's staged",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Change {
     pub path: String,
@@ -655,6 +698,51 @@ impl Repo {
             return Err(changed_again(e));
         }
         Ok((index, worktree))
+    }
+
+    /// The stash list, newest first.
+    pub fn stashes(&self) -> Vec<Stash> {
+        let out = self.git(&["stash", "list", "--format=%gd%x1f%H%x1f%gs%x1f%ct"]).unwrap_or_default();
+        out.lines()
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split('\x1f').collect();
+                let [name, hash, subject, time] = f[..] else { return None };
+                Some(Stash { name: name.into(), hash: hash.into(), subject: subject.into(), time: time.parse().unwrap_or(0) })
+            })
+            .collect()
+    }
+
+    /// Stashes the working copy's changes; returns the new stash's hash.
+    pub fn stash_push(&self, kind: StashKind, message: &str) -> Result<String, String> {
+        let before = self.rev_parse("refs/stash");
+        let mut args = vec!["stash", "push"];
+        match kind {
+            StashKind::Changes => {}
+            StashKind::WithUntracked => args.push("--include-untracked"),
+            StashKind::Staged => args.push("--staged"),
+            StashKind::KeepIndex => args.push("--keep-index"),
+        }
+        if !message.trim().is_empty() {
+            args.extend(["-m", message.trim()]);
+        }
+        self.git(&args)?;
+        // "No local changes to save" still exits 0.
+        match self.rev_parse("refs/stash") {
+            Some(h) if Some(&h) != before.as_ref() => Ok(h),
+            _ => Err(format!("Nothing to stash ({})", kind.what())),
+        }
+    }
+
+    /// What a stash would bring back: its changes against the commit it was made on, untracked
+    /// files included.
+    pub fn stash_diff(&self, name: &str, o: &DiffOpts) -> Result<Vec<FileDiff>, String> {
+        let ctx = o.context_arg();
+        let mut args = vec!["stash", "show", "-p", "--include-untracked", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", "-M", &ctx];
+        if o.ignore_ws {
+            args.push("-w");
+        }
+        args.push(name);
+        Ok(parse_diff(&self.git(&args)?))
     }
 
     /// The full unstaged patch of one file, binary-safe.
@@ -1475,6 +1563,52 @@ mod tests {
         let out = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n\n-b\n+c\n";
         let fd = &parse_diff(out)[0];
         assert_eq!(fd.hunks[0].lines, [" a", " ", "-b", "+c"]);
+    }
+
+    #[test]
+    fn stashes_push_list_and_show() {
+        let repo = temp_repo("stash");
+        let read = |p: &str| std::fs::read_to_string(repo.root.join(p)).unwrap_or_default();
+        assert!(repo.stash_push(StashKind::Changes, "nothing").is_err(), "nothing to stash");
+        std::fs::write(repo.root.join("f.txt"), "a\nB\nc\nd\n").unwrap();
+        std::fs::write(repo.root.join("new"), "untracked\n").unwrap();
+        // Tracked changes only (git's default): the untracked file stays.
+        let h = repo.stash_push(StashKind::Changes, "first").unwrap();
+        assert_eq!(read("f.txt"), "a\nb\nc\nd\n");
+        assert_eq!(read("new"), "untracked\n");
+        let list = repo.stashes();
+        assert_eq!(list.len(), 1);
+        assert_eq!((list[0].name.as_str(), list[0].hash.as_str(), list[0].parts().1), ("stash@{0}", h.as_str(), "first"));
+        let files = repo.stash_diff("stash@{0}", &DiffOpts::default()).unwrap();
+        assert_eq!(files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["f.txt"]);
+        // With untracked files: they go too, and the diff shows them.
+        let h2 = repo.stash_push(StashKind::WithUntracked, "").unwrap();
+        assert!(!repo.root.join("new").exists());
+        assert_eq!(repo.stashes()[0].hash, h2);
+        assert!(repo.stashes()[0].subject.starts_with("WIP on "), "git's own message");
+        let files = repo.stash_diff("stash@{0}", &DiffOpts::default()).unwrap();
+        assert_eq!(files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["new"]);
+        repo.git(&["stash", "pop", "-q"]).unwrap();
+        // Only what's staged; and everything but keeping the index.
+        std::fs::write(repo.root.join("new"), "untracked, changed\n").unwrap();
+        repo.stage(&["new"]).unwrap();
+        std::fs::write(repo.root.join("f.txt"), "a\nb\nc\nD\n").unwrap();
+        repo.stash_push(StashKind::Staged, "staged").unwrap();
+        assert!(!repo.root.join("new").exists());
+        assert_eq!(read("f.txt"), "a\nb\nc\nD\n", "unstaged changes stay");
+        repo.git(&["stash", "pop", "-q", "--index"]).unwrap();
+        repo.stash_push(StashKind::KeepIndex, "keep").unwrap();
+        assert_eq!(read("new"), "untracked, changed\n", "the staged file stays");
+        assert_eq!(read("f.txt"), "a\nb\nc\nd\n");
+        let _ = std::fs::remove_dir_all(&repo.root);
+    }
+
+    #[test]
+    fn stash_subjects_split_into_branch_and_message() {
+        let st = |subject: &str| Stash { name: "stash@{0}".into(), hash: "h".into(), subject: subject.into(), time: 0 };
+        assert_eq!(st("On feature/x: half done").parts(), ("feature/x", "half done"));
+        assert_eq!(st("WIP on main: 1a2b3c4 Last commit: subject").parts(), ("main", "1a2b3c4 Last commit: subject"));
+        assert_eq!(st("odd").parts(), ("", "odd"));
     }
 
     #[test]

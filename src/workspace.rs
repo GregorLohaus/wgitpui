@@ -3,6 +3,7 @@
 
 use crate::app::GitApp;
 use crate::chrome;
+use crate::config::{self, Config};
 use crate::font::UI;
 use crate::git::Repo;
 use crate::ui::{theme, Color, Cursor, Key, Rect, Ui};
@@ -33,12 +34,15 @@ pub struct Workspace {
     plus_at: (f32, f32),
     drag: Option<TabDrag>,
     error: Option<String>,
+    /// The settings file (only read and written when `persist`; else the defaults).
+    config: Config,
 }
 
 impl Workspace {
     /// Restores the previous session, then opens `arg` (if any) in a tab and focuses it.
     pub fn new(arg: Option<PathBuf>) -> Self {
         let mut ws = Self::empty(true);
+        ws.config = config::load();
         let (tabs, active, recent) = load_session();
         ws.recent = recent;
         for p in tabs {
@@ -81,6 +85,7 @@ impl Workspace {
             plus_at: (0.0, TAB_H),
             drag: None,
             error: None,
+            config: Config::default(),
         }
     }
 
@@ -93,6 +98,10 @@ impl Workspace {
     }
 
     pub fn on_focus(&mut self) {
+        // Settings edited by hand apply when you come back to the window.
+        if self.persist {
+            self.config = config::load();
+        }
         if let Some(t) = self.tabs.get_mut(self.active) {
             t.on_focus();
         }
@@ -213,9 +222,17 @@ impl Workspace {
             let recent = self.recent.clone();
             let app = &mut self.tabs[self.active];
             app.recent = recent;
+            app.key_bar = self.config.key_bar;
             let blocked = ui.blocked;
             app.frame_in(ui, body);
             ui.blocked = blocked;
+            // The tab's key bar button (or palette) switched it: that's a setting for every tab.
+            if app.key_bar != self.config.key_bar {
+                self.config.key_bar = app.key_bar;
+                if self.persist {
+                    config::save("key_bar", if app.key_bar { "true" } else { "false" });
+                }
+            }
             let requests = std::mem::take(&mut self.tabs[self.active].open_requests);
             let mut closing = Vec::new();
             let mut quiet = Vec::new();
@@ -574,16 +591,7 @@ fn pick_folder() -> Option<PathBuf> {
 // ---- session file ---------------------------------------------------------------------------
 
 fn session_path() -> Option<PathBuf> {
-    let base = if cfg!(target_os = "macos") {
-        PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support")
-    } else if cfg!(windows) {
-        PathBuf::from(std::env::var_os("APPDATA")?)
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?
-    };
-    Some(base.join("wgitpui").join("session"))
+    Some(config::dir()?.join("session"))
 }
 
 fn load_session() -> (Vec<PathBuf>, usize, Vec<PathBuf>) {
@@ -652,6 +660,32 @@ mod tests {
         let mods = Mods { logo: cfg!(target_os = "macos"), ctrl: !cfg!(target_os = "macos"), ..Default::default() };
         ui.input.keys.push(KeyPress { key: Key::Char(c), mods });
         frame(ws, ui);
+    }
+
+    #[test]
+    fn key_bar_shows_what_has_focus_runs_clicks_and_hides() {
+        let dir = repo("keybar");
+        std::fs::write(dir.join("f"), "changed").unwrap();
+        let mut ws = Workspace::for_paths(&[dir.clone()]);
+        let mut ui = Ui::new(crate::font::Fonts::load().unwrap());
+        frame(&mut ws, &mut ui);
+        let click = |ws: &mut Workspace, ui: &mut Ui, x: f32| {
+            ui.input.mouse = (x, 900.0 - 13.0);
+            ui.input.pressed = true;
+            ui.input.down = true;
+            frame(ws, ui);
+            ui.input.down = false;
+            frame(ws, ui);
+        };
+        // The files have focus: the bar starts with "space  stage", and clicking it stages.
+        assert!(ws.config.key_bar);
+        click(&mut ws, &mut ui, 30.0);
+        let staged = crate::git::run(&dir, &["diff", "--cached", "--name-only"], None).unwrap();
+        assert_eq!(staged.trim(), "f");
+        // × (far right) hides it; the workspace takes that as the setting.
+        click(&mut ws, &mut ui, 1400.0 - 17.0);
+        assert!(!ws.tabs[0].key_bar && !ws.config.key_bar);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use super::*;
 use crate::ui::KeyPress;
 
 /// Panes left to right, as laid out (wide mode hides the first two).
-const ORDER: [Pane; 4] = [Pane::Branches, Pane::Commits, Pane::Files, Pane::Main];
+const ORDER: [Pane; 5] = [Pane::Branches, Pane::Commits, Pane::Files, Pane::Stash, Pane::Main];
 
 impl GitApp {
     /// Keys for the focused pane, or for an open menu. A key that runs a command is used up.
@@ -103,7 +103,7 @@ impl GitApp {
     }
 
     /// Opens a menu from the keyboard: next to the focused pane, first item highlighted.
-    fn kb_menu(&mut self, title: String, note: Option<(String, Color)>, items: Vec<MenuItem>) {
+    pub(super) fn kb_menu(&mut self, title: String, note: Option<(String, Color)>, items: Vec<MenuItem>) {
         if items.iter().all(|i| i.act.is_none()) {
             return;
         }
@@ -148,6 +148,129 @@ impl GitApp {
         }
     }
 
+    // ---- the key bar ------------------------------------------------------------------------
+
+    /// What the key bar shows: (keys, what they do, what a click runs), and whether `?` has
+    /// more. The focused pane's keys that do something right now; while a menu, the palette,
+    /// the commit message or the resolver has the keys, theirs.
+    pub(super) fn key_bar_entries(&self) -> (Vec<(String, String, Option<Cmd>)>, bool) {
+        let info = |v: &[(&str, &str)]| v.iter().map(|(k, w)| (k.to_string(), w.to_string(), None)).collect::<Vec<_>>();
+        if self.focus == Focus::Palette {
+            return (info(&[("↑ ↓", "move"), ("enter", "run"), ("esc", "close")]), false);
+        }
+        if self.menu.is_some() {
+            return (info(&[("j k", "move"), ("enter", "pick"), ("esc", "close")]), false);
+        }
+        if self.focus == Focus::Message {
+            let on_summary = !self.msg.text[..self.msg.cursor.min(self.msg.text.len())].contains('\n');
+            return match on_summary {
+                true => (info(&[("enter", "commit"), ("tab", "description"), ("⌘enter", "commit"), ("esc", "leave")]), false),
+                false => (info(&[("enter", "new line"), ("tab", "summary"), ("⌘enter", "commit"), ("esc", "leave")]), false),
+            };
+        }
+        if self.resolving.is_some() {
+            let keys = [("1", "yours"), ("2", "incoming"), ("3", "both"), ("0", "neither"), ("e", "edit"), ("n p", "next / previous"), ("v", "preview")];
+            return (info(&[&keys[..], &[("⌘S", "save"), ("esc", "back")]].concat()), false);
+        }
+        let entries = keys::bar(self.pane)
+            .into_iter()
+            .filter(|e| self.applies(e.cmd))
+            .map(|e| (e.keys, e.label.to_string(), e.single.then_some(e.cmd)))
+            .collect();
+        (entries, true)
+    }
+
+    /// Whether a key does something right now (cheap: drawn every frame).
+    fn applies(&self, cmd: Cmd) -> bool {
+        let wip = self.showing_wip();
+        match (self.pane, cmd) {
+            (Pane::Files, Cmd::ToggleStaged | Cmd::ToggleAll | Cmd::DiscardMenu | Cmd::Stash) => wip && !self.changes.is_empty(),
+            (Pane::Files, Cmd::Amend) => wip && self.changes.iter().any(Change::staged),
+            (Pane::Files, Cmd::Enter) => !self.diff.files.is_empty(),
+            (Pane::Main, Cmd::SelectLine | Cmd::SelectHunk | Cmd::Stage | Cmd::Discard) => self.diff.selectable(),
+            (Pane::Main, Cmd::SwitchSide) => wip && self.diff.mode != DiffMode::Untracked,
+            (Pane::Commits, Cmd::PasteCommits) => !self.copied.is_empty(),
+            (Pane::Commits, Cmd::Enter) => true,
+            (Pane::Commits, _) if matches!(cmd, Cmd::Checkout | Cmd::NewBranch | Cmd::NewTag | Cmd::ResetMenu | Cmd::Revert | Cmd::CopyCommit) => {
+                self.sel_row().is_some()
+            }
+            (Pane::Commits, Cmd::MoveDown | Cmd::Squash | Cmd::Fixup | Cmd::Drop | Cmd::Reword) => self.sel_row().is_some(),
+            (Pane::Branches, Cmd::CheckoutPrev) => true,
+            (Pane::Branches, _) if keys::BINDINGS.iter().any(|b| b.pane == Some(Pane::Branches) && b.cmd == cmd) => self.cursor_ref().is_some(),
+            (_, Cmd::StashList) => !self.stashes.is_empty(),
+            (_, Cmd::OpMenu) => self.op.is_some(),
+            (_, Cmd::Commit) => self.changes.iter().any(Change::staged),
+            _ => true,
+        }
+    }
+
+    /// The keys for what has focus, along the bottom. An entry with one key can be clicked;
+    /// `?` lists them all; × hides the bar (a setting).
+    pub(super) fn draw_key_bar(&mut self, ui: &mut Ui, r: Rect) {
+        ui.p.rect(r, theme::PANEL2);
+        ui.p.rect(Rect::new(r.x, r.y, r.w, 1.0), theme::BORDER);
+        let (entries, more) = self.key_bar_entries();
+        let mut run = None;
+        let cap = |ui: &mut Ui, x: f32, keys: &str| {
+            let kw = ui.p.measure(MONO, 11.0, keys) + 10.0;
+            let kr = Rect::new(x, r.cy() - 8.5, kw, 17.0);
+            ui.p.rounded_stroke(kr, 4.0, 1.0, theme::BORDER.mix(theme::TEXT, 0.2));
+            ui.p.text(kr.x + 5.0, kr.cy(), MONO, 11.0, keys, theme::TEXT.mix(theme::DIM, 0.35));
+            kw
+        };
+        // Right: hide, and everything (where the keymap is what's listening).
+        let hide = Rect::new(r.right() - 28.0, r.y + 4.0, 22.0, r.h - 8.0);
+        let hide_hov = ui.hovered(hide);
+        if hide_hov {
+            ui.p.rounded(hide, 4.0, theme::HOVER);
+            ui.cursor = Cursor::Pointer;
+        }
+        let (cx, cy, c) = (hide.x + hide.w * 0.5, hide.cy(), if hide_hov { theme::TEXT } else { theme::FAINT });
+        ui.p.line((cx - 3.5, cy - 3.5), (cx + 3.5, cy + 3.5), 1.4, c);
+        ui.p.line((cx - 3.5, cy + 3.5), (cx + 3.5, cy - 3.5), 1.4, c);
+        let mut limit = hide.x - 8.0;
+        if more {
+            let w = ui.p.measure(MONO, 11.0, "?") + 10.0 + 6.0 + ui.p.measure(UI, 11.5, "all keys");
+            let ar = Rect::new(limit - w - 8.0, r.y + 3.0, w + 8.0, r.h - 6.0);
+            if ui.hovered(ar) {
+                ui.p.rounded(ar, 4.0, theme::HOVER);
+                ui.cursor = Cursor::Pointer;
+                if ui.input.pressed {
+                    run = Some(Cmd::Help);
+                }
+            }
+            let kw = cap(ui, ar.x + 4.0, "?");
+            ui.p.text(ar.x + 4.0 + kw + 6.0, r.cy(), UI, 11.5, "all keys", theme::DIM);
+            limit = ar.x - 10.0;
+        }
+        let mut x = r.x + 12.0;
+        for (keys, what, cmd) in &entries {
+            let w = ui.p.measure(MONO, 11.0, keys) + 10.0 + 6.0 + ui.p.measure(UI, 11.5, what);
+            if x + w > limit {
+                break;
+            }
+            let er = Rect::new(x - 4.0, r.y + 3.0, w + 8.0, r.h - 6.0);
+            if cmd.is_some() && ui.hovered(er) {
+                ui.p.rounded(er, 4.0, theme::HOVER);
+                ui.cursor = Cursor::Pointer;
+                if ui.input.pressed {
+                    run = *cmd;
+                }
+            }
+            let kw = cap(ui, x, keys);
+            ui.p.text(x + kw + 6.0, r.cy(), UI, 11.5, what, theme::DIM);
+            x += w + 16.0;
+        }
+        if hide_hov && ui.input.pressed {
+            self.key_bar = false;
+            self.toast_ok("Key bar hidden — ⌘K “Show the key bar” brings it back (or key_bar in the config file)");
+            return;
+        }
+        if let Some(c) = run {
+            self.run_cmd(c);
+        }
+    }
+
     // ---- commands ---------------------------------------------------------------------------
 
     pub(super) fn run_cmd(&mut self, cmd: Cmd) {
@@ -155,8 +278,8 @@ impl GitApp {
             return;
         }
         // The files pane also lists a commit's files; these keys only make sense for yours.
-        let wip_only = matches!(cmd, Cmd::ToggleStaged | Cmd::ToggleAll | Cmd::DiscardMenu | Cmd::ResetMenu | Cmd::Amend);
-        if wip_only && self.pane == Pane::Files && self.sel != Sel::Wip {
+        let wip_only = matches!(cmd, Cmd::ToggleStaged | Cmd::ToggleAll | Cmd::DiscardMenu | Cmd::ResetMenu | Cmd::Amend | Cmd::Stash | Cmd::StashMenu);
+        if wip_only && self.pane == Pane::Files && !self.showing_wip() {
             self.toast_err("That's for the working copy — 2 goes there");
             return;
         }
@@ -202,6 +325,7 @@ impl GitApp {
             }
             Cmd::OpMenu => self.op_menu(),
             Cmd::Wide(on) => self.wide = on,
+            Cmd::ToggleWide => self.wide = !self.wide,
             Cmd::Context(more) => self.step_context(more),
             Cmd::Whitespace => self.act(Act::ToggleWhitespace),
             Cmd::Split => self.act(Act::ToggleSplit),
@@ -240,19 +364,42 @@ impl GitApp {
                 }
             }
             Cmd::Fetch => self.act(Act::Fetch),
-            Cmd::Stash => self.toast_err("No stash in wgitpui (yet)"),
+            Cmd::Stash => {
+                if self.changes.is_empty() {
+                    self.toast_err("Nothing to stash");
+                } else {
+                    self.act(Act::PromptStash(StashKind::Changes));
+                }
+            }
+            Cmd::StashMenu => self.act(Act::StashMenu),
+            Cmd::StashList => self.act(Act::StashList),
+            Cmd::Apply => {
+                if let Some(h) = self.stash_view.clone() {
+                    self.act(Act::ApplyStash(h));
+                }
+            }
+            Cmd::Pop => {
+                if let Some(h) = self.stash_view.clone() {
+                    self.act(Act::PopStash(h));
+                }
+            }
             // The diff.
             Cmd::NextHunk => self.diff.cursor_hunk(1),
             Cmd::PrevHunk => self.diff.cursor_hunk(-1),
-            Cmd::HunkMode => self.diff.toggle_hunk_mode(),
-            Cmd::Range => self.diff.toggle_range(),
-            Cmd::RangeDown => self.diff.range_step(1),
-            Cmd::RangeUp => self.diff.range_step(-1),
+            Cmd::SelectLine => self.diff.toggle_line(),
+            Cmd::SelectHunk => self.diff.toggle_hunk(),
+            Cmd::RangeDown => self.diff.extend(1),
+            Cmd::RangeUp => self.diff.extend(-1),
             Cmd::Stage => self.stage_selection(false),
             Cmd::Discard => self.stage_selection(true),
             Cmd::SwitchSide => self.switch_side(),
             // Commits and branches.
             Cmd::Checkout => self.checkout_key(),
+            Cmd::NewBranch if self.pane == Pane::Stash => {
+                if let Some(h) = self.stash_view.clone() {
+                    self.act(Act::PromptStashBranch(h));
+                }
+            }
             Cmd::NewBranch => {
                 if let Some(h) = self.target_commit().or_else(|| self.repo.as_ref()?.rev_parse("HEAD")) {
                     self.act(Act::PromptBranchAt(h));
@@ -278,13 +425,20 @@ impl GitApp {
             Cmd::MoveUp => self.act(Act::MoveCommit(true)),
             Cmd::Squash => self.act(Act::SquashWithMessage),
             Cmd::Fixup => self.act(Act::SquashIntoParent),
+            Cmd::Drop if self.pane == Pane::Stash => {
+                let st = self.stash_view.as_ref().and_then(|h| self.stashes.iter().find(|s| &s.hash == h)).cloned();
+                if let Some(st) = st {
+                    let mut it = danger(format!("Drop {}", st.name), Act::DropStash(st.hash.clone()));
+                    it.detail = "undoable".into();
+                    self.kb_menu(st.parts().1.to_string(), None, vec![it]);
+                }
+            }
             Cmd::Drop => self.act(Act::DropCommit),
             Cmd::Reword => {
                 if let Some(h) = self.selected_commit() {
                     self.act(Act::PromptReword(h));
                 }
             }
-            Cmd::Worktree => self.worktree_key(),
             Cmd::Delete => self.delete_menu(),
             Cmd::Merge => self.merge_menu(),
             Cmd::Rebase => match self.cursor_ref() {
@@ -296,6 +450,11 @@ impl GitApp {
                 Some(r) if r.kind == RefKind::Local => self.act(Act::PromptUpstream(r.name)),
                 _ => self.toast_err("Pick a local branch to set its upstream"),
             },
+            Cmd::Rename if self.pane == Pane::Stash => {
+                if let Some(h) = self.stash_view.clone() {
+                    self.act(Act::PromptStashRename(h));
+                }
+            }
             Cmd::Rename => match self.cursor_ref() {
                 Some(r) if r.kind == RefKind::Local => self.act(Act::PromptRename(r.name)),
                 _ => self.toast_err("Pick a local branch to rename"),
@@ -326,6 +485,11 @@ impl GitApp {
     // ---- panes ------------------------------------------------------------------------------
 
     fn set_pane(&mut self, p: Pane) {
+        let p = match p {
+            Pane::Files | Pane::Stash if self.stash_view.is_some() => Pane::Stash,
+            Pane::Stash => Pane::Files,
+            p => p,
+        };
         if self.pane == Pane::Main && p != Pane::Main {
             self.diff.cursor_clear();
         }
@@ -336,13 +500,13 @@ impl GitApp {
                     self.pane = Pane::Files;
                     return;
                 }
-                if self.sel != Sel::Wip && self.diff.cursor.is_none() {
+                if !self.showing_wip() && self.diff.cursor.is_none() {
                     self.diff.cursor_in_file(self.file_cursor);
                 } else {
                     self.diff.cursor_start();
                 }
             }
-            Pane::Files if self.sel != Sel::Wip => {
+            Pane::Files | Pane::Stash if !self.showing_wip() => {
                 let n = self.diff.files.len();
                 self.file_cursor = self.diff.current_file(self.diff.split()).unwrap_or(0).min(n.saturating_sub(1));
             }
@@ -369,40 +533,30 @@ impl GitApp {
         self.set_pane(order[j as usize]);
     }
 
-    /// 1 workspace, 2 files, 3 branches, 4 commits (lazygit's numbering). Panes wide mode hides
-    /// bring the normal layout back.
+    /// 1 2 3 4: the panels left to right — sidebar, commits, files, diff. The two that wide
+    /// mode hides bring the normal layout back.
     fn jump(&mut self, n: u8) {
-        if matches!(n, 1 | 3 | 4) {
+        if matches!(n, 1 | 2) {
             self.wide = false;
         }
         match n {
-            1 => {
-                self.set_pane(Pane::Branches);
-                self.side_cursor = Some(SideKey::Wip);
-                self.reveal_side();
-            }
-            2 => {
-                if self.sel != Sel::Wip {
-                    self.select(Sel::Wip);
-                }
-                self.set_pane(Pane::Files);
-            }
-            3 => {
-                self.set_pane(Pane::Branches);
-                if self.side_cursor == Some(SideKey::Wip) {
-                    self.side_cursor = None;
-                    self.set_pane(Pane::Branches);
-                }
-            }
-            4 => self.set_pane(Pane::Commits),
-            _ => self.toast_err("No stash pane in wgitpui"),
+            1 => self.set_pane(Pane::Branches),
+            2 => self.set_pane(Pane::Commits),
+            3 => self.set_pane(Pane::Files),
+            4 => self.set_pane(Pane::Main),
+            _ => {}
         }
     }
 
     fn enter(&mut self) {
         match self.pane {
             Pane::Branches => match self.side_cursor.clone() {
-                Some(SideKey::Wip) => self.jump(2),
+                Some(SideKey::Wip) => {
+                    if self.sel != Sel::Wip {
+                        self.select(Sel::Wip);
+                    }
+                    self.set_pane(Pane::Files);
+                }
                 Some(SideKey::Worktree(p)) => self.act(Act::OpenWorktree(p.display().to_string())),
                 Some(SideKey::Ref(_)) => {
                     self.side_preview();
@@ -411,8 +565,9 @@ impl GitApp {
                 None => {}
             },
             Pane::Commits => self.set_pane(Pane::Files),
+            Pane::Stash => self.set_pane(Pane::Main),
             Pane::Files => {
-                let conflicted = self.wip_file.as_ref().filter(|_| self.sel == Sel::Wip).filter(|(p, _)| self.changes.iter().any(|c| &c.path == p && c.conflicted()));
+                let conflicted = self.wip_file.as_ref().filter(|_| self.showing_wip()).filter(|(p, _)| self.changes.iter().any(|c| &c.path == p && c.conflicted()));
                 match conflicted {
                     Some((p, _)) => {
                         let p = p.clone();
@@ -427,11 +582,20 @@ impl GitApp {
 
     fn back(&mut self) {
         match self.pane {
+            // A selection goes first, then the diff.
+            Pane::Main if self.diff.selectable() && !self.diff.selected.is_empty() => {
+                self.diff.selected.clear();
+                return;
+            }
             Pane::Main => {
                 self.set_pane(Pane::Files);
                 return;
             }
-            Pane::Files if self.sel != Sel::Wip && self.compare.is_none() => {
+            Pane::Stash => {
+                self.close_stash();
+                return;
+            }
+            Pane::Files if !self.showing_wip() && self.compare.is_none() => {
                 self.set_pane(Pane::Commits);
                 return;
             }
@@ -467,7 +631,7 @@ impl GitApp {
                     self.side_preview();
                 }
             }
-            _ if self.sel_row().is_some() && self.compare.is_none() => {
+            _ if self.sel_row().is_some() && self.compare.is_none() && self.stash_view.is_none() => {
                 if self.tab == Tab::Files {
                     self.tab = Tab::Changes;
                     self.file_view = None;
@@ -483,7 +647,7 @@ impl GitApp {
         match self.pane {
             Pane::Branches => self.side_step(d),
             Pane::Commits => self.graph_step(d),
-            Pane::Files => self.file_step(d),
+            Pane::Files | Pane::Stash => self.file_step(d),
             Pane::Main => self.diff.cursor_step(d),
         }
     }
@@ -492,7 +656,7 @@ impl GitApp {
         match self.pane {
             Pane::Branches => self.side_step(d * 10),
             Pane::Commits => self.graph_step(d * ((self.graph_view_h / ROW_H) as i64 - 2).max(1)),
-            Pane::Files => self.file_step(d * 10),
+            Pane::Files | Pane::Stash => self.file_step(d * 10),
             Pane::Main => self.diff.cursor_page(d),
         }
     }
@@ -594,25 +758,11 @@ impl GitApp {
         }
     }
 
-    fn worktree_key(&mut self) {
-        let from = match self.pane {
-            Pane::Branches => self.cursor_ref().map(|r| match r.kind {
-                RefKind::Local if self.branch_free(&r.name) => WtFrom { rev: r.name.clone(), label: r.name.clone(), branch: Some(r.name.clone()), prefill: String::new() },
-                RefKind::Remote => WtFrom { rev: r.name.clone(), label: r.name.clone(), branch: None, prefill: branch_short(&r).to_string() },
-                _ => WtFrom { rev: r.name.clone(), label: r.name.clone(), branch: None, prefill: String::new() },
-            }),
-            _ => self.wt_from_selection(),
-        };
-        if let Some(f) = from {
-            self.act(Act::NewWorktree(f));
-        }
-    }
-
     /// g: reset the current branch to the selected commit or branch; D (files): reset options
     /// for the working copy.
     fn reset_menu(&mut self) {
         let head = self.head_name.clone();
-        if self.pane == Pane::Files && self.sel == Sel::Wip {
+        if self.pane == Pane::Files && self.showing_wip() {
             let mut items = vec![];
             if self.changes.iter().any(|c| c.unstaged()) {
                 let mut it = danger("Discard all unstaged changes", Act::DiscardAll);
@@ -716,7 +866,6 @@ impl GitApp {
             .into_iter()
             .map(|(k, help, cmd)| {
                 let mut it = item(help, Act::Key(cmd));
-                it.detail = k.join("  ");
                 it.keys = k;
                 it
             })
@@ -916,7 +1065,7 @@ impl GitApp {
 
     /// The file the focused pane points at.
     fn cursor_file(&self) -> Option<String> {
-        if self.sel == Sel::Wip {
+        if self.showing_wip() {
             return self.wip_file.as_ref().map(|(p, _)| p.clone());
         }
         let f = if self.pane == Pane::Main { self.diff.cursor.map(|c| c.0) } else { Some(self.file_cursor) };
@@ -924,7 +1073,7 @@ impl GitApp {
     }
 
     fn file_step(&mut self, d: i64) {
-        if self.sel != Sel::Wip {
+        if !self.showing_wip() {
             let n = self.diff.files.len();
             if n == 0 {
                 return;
@@ -965,7 +1114,7 @@ impl GitApp {
     /// space: stage the file if it's unstaged, unstage it if it's staged. The cursor stays at
     /// the same place in the list, so the next file slides under it.
     fn toggle_staged(&mut self) {
-        if self.sel != Sel::Wip {
+        if !self.showing_wip() {
             return;
         }
         let Some((path, staged)) = self.wip_file.clone() else { return };
@@ -985,7 +1134,7 @@ impl GitApp {
     }
 
     fn discard_menu(&mut self) {
-        let Some(path) = self.cursor_file().filter(|_| self.sel == Sel::Wip) else { return };
+        let Some(path) = self.cursor_file().filter(|_| self.showing_wip()) else { return };
         let c = self.changes.iter().find(|c| c.path == path).cloned();
         let Some(c) = c else { return };
         let mut items = Vec::new();
@@ -1024,15 +1173,17 @@ impl GitApp {
 
     // ---- the diff ---------------------------------------------------------------------------
 
-    /// space / d in the diff: stage (or unstage) or discard what the cursor selects, then keep
-    /// going from the same place.
+    /// s / d in the diff: stage (or unstage) or discard the selected lines, or with none, the
+    /// line under the cursor; then keep going from the same place.
     fn stage_selection(&mut self, discard: bool) {
-        let Some(c) = self.diff.cursor else { return };
-        if !self.diff.selectable() || self.diff.selected.is_empty() {
-            self.toast_err("Only working-copy changes can be staged");
+        if !self.diff.selectable() {
+            self.toast_err("Only working-copy changes can be staged or discarded");
             return;
         }
-        self.apply_diff_action(DiffAction::Lines { f: c.0, discard });
+        self.diff.take_cursor_line();
+        // The file with the selection (the working copy shows one).
+        let Some(f) = self.diff.selected.iter().map(|s| s.0).min() else { return };
+        self.apply_diff_action(DiffAction::Lines { f, discard });
         if self.pane == Pane::Main && self.diff.cursor.is_none() {
             self.diff.cursor_start();
             if self.diff.cursor.is_none() {
@@ -1043,7 +1194,7 @@ impl GitApp {
 
     /// tab in the diff: the file's staged changes instead of its unstaged ones, or back.
     fn switch_side(&mut self) {
-        let Some((path, staged)) = self.wip_file.clone().filter(|_| self.sel == Sel::Wip) else { return };
+        let Some((path, staged)) = self.wip_file.clone().filter(|_| self.showing_wip()) else { return };
         let other = self.changes.iter().any(|c| c.path == path && if staged { c.unstaged() } else { c.staged() });
         if !other {
             self.toast_err(if staged { "No unstaged changes in this file" } else { "Nothing staged in this file" });

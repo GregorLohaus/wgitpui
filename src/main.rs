@@ -14,6 +14,7 @@ mod diffview;
 mod fileview;
 mod palette;
 mod clipboard;
+mod config;
 mod font;
 mod git;
 mod gpu;

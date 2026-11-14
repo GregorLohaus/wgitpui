@@ -111,11 +111,9 @@ pub struct DiffView {
     pub hscroll: f32,
     pub selected: HashSet<(usize, usize, usize)>,
     drag: Option<Drag>,
-    /// Keyboard cursor (lazygit's staging view): a `+`/`-` line. In `hunk_mode` its whole hunk
-    /// is selected; with an `anchor` (range select), everything from there to the cursor.
+    /// Keyboard cursor: a `+`/`-` line. It moves on its own; the keys select lines and hunks
+    /// under it into `selected`, like clicks do.
     pub cursor: Option<(usize, usize, usize)>,
-    anchor: Option<(usize, usize, usize)>,
-    pub hunk_mode: bool,
     /// The diff has keyboard focus: draw the cursor.
     pub kb_focus: bool,
     /// Layout and visible height at the last draw (the cursor follows what's on screen).
@@ -226,8 +224,6 @@ impl DiffView {
             selected: HashSet::new(),
             drag: None,
             cursor: None,
-            anchor: None,
-            hunk_mode: false,
             kb_focus: false,
             last_split: false,
             view_h: 600.0,
@@ -538,10 +534,8 @@ impl DiffView {
 
     /// The cursor on the first change of file `f`.
     pub fn cursor_in_file(&mut self, f: usize) {
-        let first = self.change_rows().into_iter().find(|(k, _)| k.0 == f).map(|(k, _)| k);
-        self.anchor = None;
-        match first {
-            Some(k) => self.put_cursor(Some(k)),
+        match self.change_rows().into_iter().find(|(k, _)| k.0 == f) {
+            Some((k, _)) => self.put_cursor(k),
             None => self.cursor_start(),
         }
     }
@@ -561,41 +555,15 @@ impl DiffView {
         out
     }
 
-    /// Selects what the cursor covers (when this diff can stage or discard): its line, its
-    /// hunk, or the range from the anchor.
-    fn sync_selection(&mut self) {
-        if !self.selectable() {
-            return;
-        }
-        self.selected.clear();
-        let Some(c) = self.cursor else { return };
-        if self.hunk_mode {
-            let lines = &self.files[c.0].hunks[c.1].lines;
-            self.selected.extend((0..lines.len()).filter(|&l| lines[l].starts_with(['+', '-'])).map(|l| (c.0, c.1, l)));
-        } else if let Some(a) = self.anchor {
-            let ch = self.change_rows();
-            let pos = |k| ch.iter().position(|(x, _)| *x == k);
-            if let (Some(i), Some(j)) = (pos(a), pos(c)) {
-                self.selected.extend(ch[i.min(j)..=i.max(j)].iter().map(|(k, _)| *k));
-            }
-        } else {
-            self.selected.insert(c);
-        }
-    }
-
     fn reveal_cursor(&mut self) {
         let Some(c) = self.cursor else { return };
         let Some(row) = self.change_rows().into_iter().find(|(k, _)| *k == c).map(|(_, r)| r) else { return };
-        // A little context around it (the hunk header, in hunk mode).
-        let above = if self.hunk_mode { c.2 + 2 } else { 2 };
-        self.scroll.reveal(row.saturating_sub(above) as f32 * DIFF_ROW_H, (row + 3) as f32 * DIFF_ROW_H, self.view_h);
+        // A little context around it.
+        self.scroll.reveal(row.saturating_sub(2) as f32 * DIFF_ROW_H, (row + 3) as f32 * DIFF_ROW_H, self.view_h);
     }
 
-    fn put_cursor(&mut self, k: Option<(usize, usize, usize)>) {
-        if k.is_some() {
-            self.cursor = k;
-        }
-        self.sync_selection();
+    fn put_cursor(&mut self, k: (usize, usize, usize)) {
+        self.cursor = Some(k);
         self.reveal_cursor();
     }
 
@@ -605,29 +573,20 @@ impl DiffView {
         if !self.cursor.is_some_and(|c| ch.iter().any(|(k, _)| *k == c)) {
             self.cursor = ch.first().map(|(k, _)| *k);
         }
-        self.anchor = None;
-        self.put_cursor(None);
+        self.reveal_cursor();
     }
 
-    /// Leaving the diff: no cursor, nothing selected.
+    /// Leaving the diff (the selection stays, as a click's does).
     pub fn cursor_clear(&mut self) {
         self.cursor = None;
-        self.anchor = None;
-        self.hunk_mode = false;
-        if self.selectable() {
-            self.selected.clear();
-        }
     }
 
-    /// The next / previous change line, or hunk in hunk mode.
+    /// The next / previous change line.
     pub fn cursor_step(&mut self, d: i64) {
-        if self.hunk_mode {
-            return self.cursor_hunk(d);
-        }
         let ch = self.change_rows();
         let Some(i) = self.cursor.and_then(|c| ch.iter().position(|(k, _)| *k == c)) else { return self.cursor_start() };
         let j = (i as i64 + d).clamp(0, ch.len() as i64 - 1) as usize;
-        self.put_cursor(Some(ch[j].0));
+        self.put_cursor(ch[j].0);
     }
 
     /// The first change of the next / previous hunk.
@@ -636,21 +595,23 @@ impl DiffView {
         let Some(c) = self.cursor else { return self.cursor_start() };
         let mut hunks: Vec<(usize, usize)> = Vec::new();
         for ((f, h, _), _) in &ch {
-            if hunks.last() != Some(&(*f, *h)) && !hunks.contains(&(*f, *h)) {
+            if !hunks.contains(&(*f, *h)) {
                 hunks.push((*f, *h));
             }
         }
         let Some(i) = hunks.iter().position(|x| *x == (c.0, c.1)) else { return };
         let j = (i as i64 + d).clamp(0, hunks.len() as i64 - 1) as usize;
-        let first = ch.iter().find(|((f, h, _), _)| (*f, *h) == hunks[j]).map(|(k, _)| *k);
-        self.put_cursor(first);
+        if let Some((k, _)) = ch.iter().find(|((f, h, _), _)| (*f, *h) == hunks[j]) {
+            self.put_cursor(*k);
+        }
     }
 
     /// The first / last change.
     pub fn cursor_edge(&mut self, last: bool) {
         let ch = self.change_rows();
-        let k = if last { ch.last() } else { ch.first() };
-        self.put_cursor(k.map(|(k, _)| *k));
+        if let Some((k, _)) = if last { ch.last() } else { ch.first() } {
+            self.put_cursor(*k);
+        }
     }
 
     /// About a screenful of changes down / up.
@@ -663,29 +624,46 @@ impl DiffView {
         } else {
             ch.iter().position(|(_, r)| (*r as i64) >= target).unwrap_or(i).min(i)
         };
-        self.put_cursor(Some(ch[j].0));
+        self.put_cursor(ch[j].0);
     }
 
-    pub fn toggle_hunk_mode(&mut self) {
-        self.hunk_mode = !self.hunk_mode;
-        self.anchor = None;
-        self.put_cursor(None);
-    }
-
-    /// v: start a range at the cursor, or drop it.
-    pub fn toggle_range(&mut self) {
-        self.anchor = if self.anchor.is_some() { None } else { self.cursor };
-        self.hunk_mode = false;
-        self.put_cursor(None);
-    }
-
-    /// Shift-↓ / ↑: grow the range (starting one if needed).
-    pub fn range_step(&mut self, d: i64) {
-        if self.anchor.is_none() {
-            self.anchor = self.cursor;
+    /// space: selects the line under the cursor, or unselects it.
+    pub fn toggle_line(&mut self) {
+        if let Some(c) = self.cursor.filter(|_| self.selectable()) {
+            let on = !self.selected.contains(&c);
+            self.set_selected(c, on);
         }
-        self.hunk_mode = false;
+    }
+
+    /// a: selects the cursor's whole hunk, or (when it all is) unselects it.
+    pub fn toggle_hunk(&mut self) {
+        let Some(c) = self.cursor.filter(|_| self.selectable()) else { return };
+        let lines = &self.files[c.0].hunks[c.1].lines;
+        let keys: Vec<_> = (0..lines.len()).filter(|&l| lines[l].starts_with(['+', '-'])).map(|l| (c.0, c.1, l)).collect();
+        let on = !keys.iter().all(|k| self.selected.contains(k));
+        for k in keys {
+            self.set_selected(k, on);
+        }
+    }
+
+    /// Shift-↓ / ↑: selects the line under the cursor and the one it moves to.
+    pub fn extend(&mut self, d: i64) {
+        let Some(c) = self.cursor.filter(|_| self.selectable()) else { return self.cursor_step(d) };
+        self.selected.insert(c);
         self.cursor_step(d);
+        if let Some(c) = self.cursor {
+            self.selected.insert(c);
+        }
+    }
+
+    /// What staging or discarding takes: the selection, or with nothing selected, the line
+    /// under the cursor (which this then selects).
+    pub fn take_cursor_line(&mut self) {
+        if self.selected.is_empty() && self.selectable() {
+            if let Some(c) = self.cursor {
+                self.selected.insert(c);
+            }
+        }
     }
 
     /// The cursor's place among the changes, to put it back after the diff reloads.
@@ -694,16 +672,14 @@ impl DiffView {
         self.change_rows().iter().position(|(k, _)| *k == c)
     }
 
-    /// Carries the cursor (by its place among the changes) and mode over from `old`, the same
-    /// diff loaded again: after staging the line under it, the next one slides into place.
+    /// Carries the cursor (by its place among the changes) over from `old`, the same diff
+    /// loaded again: after staging the line under it, the next one slides into place.
     pub fn keep_cursor(&mut self, old: &DiffView) {
         self.last_split = old.last_split;
         self.view_h = old.view_h;
         let Some(n) = old.cursor_ordinal() else { return };
         let ch = self.change_rows();
         self.cursor = ch.get(n.min(ch.len().saturating_sub(1))).map(|(k, _)| *k);
-        self.hunk_mode = old.hunk_mode;
-        self.sync_selection();
     }
 
     pub fn scroll_by(&mut self, dy: f32) {
@@ -736,7 +712,7 @@ impl DiffView {
         if let Some((row, side, key)) = hover {
             ui.cursor = Cursor::Pointer;
             if ui.input.pressed {
-                (self.cursor, self.anchor, self.hunk_mode) = (Some(key), None, false);
+                self.cursor = Some(key);
                 let on = !self.selected.contains(&key);
                 self.set_selected(key, on);
                 self.drag = Some(Drag { on, side, row });

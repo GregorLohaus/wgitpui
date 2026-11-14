@@ -86,6 +86,26 @@ pub enum Act {
     DiscardFile(String),
     /// `git switch -`.
     CheckoutPrev,
+    /// Show / hide the key bar along the bottom.
+    ToggleKeyBar,
+    /// The ways to stash (a menu).
+    StashMenu,
+    /// Ask for a message, then stash.
+    PromptStash(crate::git::StashKind),
+    Stash { kind: crate::git::StashKind, message: String },
+    /// The stash list (a menu).
+    StashList,
+    /// Show a stash (by hash) in the right-hand panel.
+    OpenStash(String),
+    ApplyStash(String),
+    PopStash(String),
+    DropStash(String),
+    /// Ask for a branch name, then `git stash branch`.
+    PromptStashBranch(String),
+    StashBranch { hash: String, branch: String },
+    /// Ask for a new message, then rename the stash.
+    PromptStashRename(String),
+    RenameStash { hash: String, message: String },
     ResolveUse(String, bool),
     MarkResolved(String),
     OpenResolver(String),
@@ -157,6 +177,12 @@ pub struct Palette {
     pub reword_of: Option<String>,
     /// When set, the palette is asking for this branch's new name.
     pub rename_of: Option<String>,
+    /// When set, the palette is asking for a stash message (then stashes this way).
+    pub stash_kind: Option<crate::git::StashKind>,
+    /// When set, the palette is asking for a branch to make from this stash (hash).
+    pub stash_branch: Option<String>,
+    /// When set, the palette is asking for this stash's new message.
+    pub stash_rename: Option<String>,
     /// True on the frame the palette opened: the click that opened it must not close it.
     pub fresh: bool,
 }
@@ -172,6 +198,9 @@ impl Palette {
         self.upstream_for = None;
         self.reword_of = None;
         self.rename_of = None;
+        self.stash_kind = None;
+        self.stash_branch = None;
+        self.stash_rename = None;
         self.fresh = true;
     }
 }

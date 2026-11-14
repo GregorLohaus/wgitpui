@@ -4,7 +4,7 @@ use crate::chrome;
 use crate::diffview::{BlameSrc, DiffAction, DiffMode, DiffView};
 use crate::fileview::{FileAction, FileView, TreeAction, TreeView};
 use crate::font::{MONO, UI};
-use crate::git::{self, Change, Commit, DiffOpts, LogMsg, MergePreview, OpKind, Ref, RefKind, Repo, Side, Worktree};
+use crate::git::{self, Change, Commit, DiffOpts, LogMsg, MergePreview, OpKind, Ref, RefKind, Repo, Side, Stash, StashKind, Worktree};
 use crate::graph::Graph;
 use crate::keys::{self, Cmd, Pane};
 
@@ -111,6 +111,8 @@ struct Menu {
 }
 
 const MENU_ROW_H: f32 = 30.0;
+/// The key bar along the bottom.
+const KEY_BAR_H: f32 = 26.0;
 
 impl Menu {
     fn new(at: (f32, f32), title: String, note: Option<(String, Color)>, items: Vec<MenuItem>) -> Menu {
@@ -164,6 +166,10 @@ enum Undo {
     Patch { patch: String, label: String },
     /// A patch that was reverse-applied to the index (discarded staged lines).
     IndexPatch { patch: String, label: String },
+    /// Changes that went into a stash: popping it brings them back.
+    Unstash { hash: String, label: String },
+    /// A stash entry to put back as it was (after a drop or a rename).
+    Restash { hash: String, subject: String, label: String },
     /// An untracked file that was deleted.
     Restore { path: String, data: Vec<u8>, label: String },
     /// HEAD moved (commit, amend, rebase); go back to `to`.
@@ -180,6 +186,8 @@ impl Undo {
         match self {
             Undo::Patch { label, .. }
             | Undo::IndexPatch { label, .. }
+            | Undo::Unstash { label, .. }
+            | Undo::Restash { label, .. }
             | Undo::Restore { label, .. }
             | Undo::Reset { label, .. }
             | Undo::Many(_, label)
@@ -344,6 +352,9 @@ pub struct GitApp {
     remote_btns: [(f32, f32); 3],
     /// Recently opened repositories (for the palette), provided by the workspace.
     pub recent: Vec<PathBuf>,
+    /// Show the key bar along the bottom (a setting the workspace keeps; the bar's own button
+    /// and the palette switch it here).
+    pub key_bar: bool,
     // Keyboard (lazygit-style).
     /// The pane keys go to, and whether the keyboard is driving (then a ring shows it).
     pane: Pane,
@@ -362,6 +373,10 @@ pub struct GitApp {
     copied: Vec<String>,
     /// Where the diff (with its toolbar) was drawn this frame.
     main_rect: Option<Rect>,
+    /// `git stash list`, and the stash (by hash) shown in the right-hand panel instead of the
+    /// selection.
+    stashes: Vec<Stash>,
+    stash_view: Option<String>,
 }
 
 impl GitApp {
@@ -433,6 +448,7 @@ impl GitApp {
             close_requests: vec![],
             remote_btns: [(f32::MAX, TOP_H + 6.0); 3],
             recent: vec![],
+            key_bar: true,
             pane: Pane::Commits,
             kb: false,
             pane_rects: vec![],
@@ -443,6 +459,8 @@ impl GitApp {
             list_view_h: [LIST_ROW_H * 7.0; 2],
             copied: vec![],
             main_rect: None,
+            stashes: vec![],
+            stash_view: None,
         };
         let path = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         app.open(path);
@@ -627,6 +645,16 @@ impl GitApp {
         match u {
             Undo::Patch { patch, .. } => repo.apply_worktree(patch, false),
             Undo::IndexPatch { patch, .. } => repo.apply_cached(patch, false),
+            Undo::Unstash { hash, .. } => match repo.stashes().into_iter().find(|s| &s.hash == hash) {
+                Some(s) => repo.git(&["stash", "pop", "--index", &s.name]).or_else(|_| repo.git(&["stash", "pop", &s.name])),
+                None => repo.git(&["stash", "apply", "--index", hash]).or_else(|_| repo.git(&["stash", "apply", hash])),
+            },
+            Undo::Restash { hash, subject, .. } => {
+                if let Some(s) = repo.stashes().into_iter().find(|s| &s.hash == hash) {
+                    repo.git(&["stash", "drop", &s.name])?;
+                }
+                repo.git(&["stash", "store", "-m", subject, hash])
+            }
             Undo::Restore { path, data, .. } => {
                 let p = repo.root.join(path);
                 if let Some(parent) = p.parent() {
@@ -783,6 +811,10 @@ impl GitApp {
         }
         if let Some(repo) = &self.repo {
             self.op = repo.op_in_progress();
+            self.stashes = repo.stashes();
+        }
+        if self.stash_view.as_ref().is_some_and(|h| !self.stashes.iter().any(|s| &s.hash == h)) {
+            self.close_stash();
         }
         self.reload_status();
         self.reload_worktrees();
@@ -953,9 +985,14 @@ impl GitApp {
                 .map(|c| (c.path.clone(), false))
                 .or_else(|| self.changes.iter().find(|c| c.staged()).map(|c| (c.path.clone(), true)));
         }
-        if self.sel == Sel::Wip {
+        if self.showing_wip() {
             self.load_wip_diff();
         }
+    }
+
+    /// The right-hand panel shows the working copy (not a commit, a comparison or a stash).
+    fn showing_wip(&self) -> bool {
+        self.sel == Sel::Wip && self.compare.is_none() && self.stash_view.is_none()
     }
 
     fn load_wip_diff(&mut self) {
@@ -1000,11 +1037,10 @@ impl GitApp {
 
     fn replace_diff(old: &mut DiffView, mut view: DiffView) {
         if view.key == old.key {
-            // Keyboard staging goes on from the same place; a mouse selection carries over as is.
+            view.keep_selection(old);
+            // Keyboard staging goes on from the same place.
             if old.cursor.is_some() && old.kb_focus {
                 view.keep_cursor(old);
-            } else {
-                view.keep_selection(old);
             }
             view.scroll = std::mem::take(&mut old.scroll);
             view.hscroll = old.hscroll;
@@ -1030,6 +1066,7 @@ impl GitApp {
 
     fn select(&mut self, sel: Sel) {
         self.sel = sel;
+        self.stash_view = None;
         match sel {
             Sel::Wip => {
                 self.selected = None;
@@ -1130,6 +1167,8 @@ impl GitApp {
     fn reload_diff(&mut self) {
         if self.compare.is_some() {
             self.load_compare();
+        } else if let Some(h) = self.stash_view.clone() {
+            self.open_stash(&h);
         } else if self.sel == Sel::Wip {
             self.load_wip_diff();
         } else if let (Some(i), Some(repo)) = (self.sel_row(), &self.repo) {
@@ -1614,6 +1653,87 @@ impl GitApp {
                 }
                 self.reload_status();
             }
+            Act::StashMenu => {
+                let items = self.stash_menu_items();
+                self.kb_menu("Stash".into(), None, items);
+            }
+            Act::PromptStash(kind) => {
+                self.focus = Focus::Palette;
+                self.palette.reset("");
+                self.palette.stash_kind = Some(kind);
+            }
+            Act::Stash { kind, message } => {
+                match repo.stash_push(kind, &message) {
+                    Ok(hash) => self.push_undo(Undo::Unstash { hash, label: format!("stash {}", kind.what()) }),
+                    Err(e) => self.toast_err(e),
+                }
+                self.reload_all(false);
+            }
+            Act::StashList => {
+                if self.stashes.is_empty() {
+                    self.toast_err("No stashes — s in the files stashes your changes");
+                } else {
+                    let items = self.stash_list_items();
+                    self.kb_menu("Stashes".into(), None, items);
+                }
+            }
+            Act::OpenStash(hash) => {
+                self.open_stash(&hash);
+                if self.stash_view.is_some() {
+                    self.pane = Pane::Stash;
+                }
+            }
+            Act::ApplyStash(hash) => self.apply_stash(&hash, false),
+            Act::PopStash(hash) => self.apply_stash(&hash, true),
+            Act::DropStash(hash) => {
+                let Some(st) = self.stashes.iter().find(|s| s.hash == hash).cloned() else { return };
+                let r = repo.git(&["stash", "drop", &st.name]);
+                if self.result(r, "") {
+                    self.push_undo(Undo::Restash { hash: st.hash.clone(), subject: st.subject.clone(), label: format!("drop {}", st.name) });
+                }
+                if self.stash_view.as_deref() == Some(st.hash.as_str()) {
+                    self.close_stash();
+                }
+                self.reload_all(false);
+            }
+            Act::PromptStashBranch(hash) => {
+                self.focus = Focus::Palette;
+                self.palette.reset("");
+                self.palette.stash_branch = Some(hash);
+            }
+            Act::StashBranch { hash, branch } => {
+                let Some(st) = self.stashes.iter().find(|s| s.hash == hash).cloned() else { return };
+                let r = repo.git(&["stash", "branch", &branch, &st.name]);
+                if self.result(r, &format!("On {branch} now, with {} applied", st.name)) {
+                    self.select(Sel::Wip);
+                    self.pane = Pane::Files;
+                }
+                self.reload_all(false);
+            }
+            Act::PromptStashRename(hash) => {
+                let msg = self.stashes.iter().find(|s| s.hash == hash).map(|s| s.parts().1.to_string()).unwrap_or_default();
+                self.focus = Focus::Palette;
+                self.palette.reset(&msg);
+                self.palette.stash_rename = Some(hash);
+            }
+            Act::RenameStash { hash, message } => {
+                let Some(st) = self.stashes.iter().find(|s| s.hash == hash).cloned() else { return };
+                let subject = match st.parts().0 {
+                    "" => message.clone(),
+                    branch => format!("On {branch}: {message}"),
+                };
+                // Git can't rename one: drop it and store the same commit again (it comes back on
+                // top). Should storing fail, the old entry goes back.
+                let r = repo.git(&["stash", "drop", &st.name]).and_then(|_| {
+                    repo.git(&["stash", "store", "-m", &subject, &st.hash]).inspect_err(|_| {
+                        let _ = repo.git(&["stash", "store", "-m", &st.subject, &st.hash]);
+                    })
+                });
+                if self.result(r, "") {
+                    self.push_undo(Undo::Restash { hash: st.hash.clone(), subject: st.subject.clone(), label: format!("rename {}", st.name) });
+                }
+                self.reload_all(false);
+            }
             Act::CheckoutPrev => {
                 let r = repo.git(&["switch", "-"]);
                 self.result(r, "Switched to the previous branch");
@@ -1744,6 +1864,7 @@ impl GitApp {
                 self.layout = if self.split_for(w) { Layout::Unified } else { Layout::Split };
             }
             Act::ToggleWide => self.wide = !self.wide,
+            Act::ToggleKeyBar => self.key_bar = !self.key_bar,
             Act::ToggleWhitespace => {
                 self.opts.ignore_ws = !self.opts.ignore_ws;
                 self.reload_diff();
@@ -1803,6 +1924,7 @@ impl GitApp {
                 self.select_hash(&h);
                 return;
             }
+            DiffAction::Blame(_) if self.stash_view.is_some() => return,
             DiffAction::Blame(path) => {
                 let rev = self.selected.as_ref().map(|c| c.hash.clone()).filter(|_| self.sel != Sel::Wip);
                 self.file_view = Some(FileView::load(repo, rev.clone(), path, true));
@@ -2085,6 +2207,7 @@ impl GitApp {
 
         let mut area = bounds;
         ui.p.rect(area, theme::BG);
+        let bar = if self.key_bar && self.repo.is_some() { area.take_bottom(KEY_BAR_H) } else { Rect::default() };
         self.ref_hits.clear();
         if self.focus == Focus::Palette || self.menu.is_some() {
             ui.blocked = true;
@@ -2114,6 +2237,9 @@ impl GitApp {
         }
         ui.blocked = false;
         self.draw_focus(ui);
+        if bar.h > 0.0 {
+            self.draw_key_bar(ui, bar);
+        }
         self.branch_drag(ui);
         if self.menu.is_some() {
             self.draw_menu(ui);
@@ -3185,7 +3311,8 @@ impl GitApp {
             Some(m) => Rect::new(inner.x, inner.y, inner.w, (m.y - inner.y).max(0.0)),
             None => inner,
         };
-        self.pane_rects.push((Pane::Files, files));
+        // An open stash's file list takes the stash keys.
+        self.pane_rects.push((if self.stash_view.is_some() { Pane::Stash } else { Pane::Files }, files));
         if let Some(m) = main {
             self.pane_rects.push((Pane::Main, m));
         }
@@ -3201,6 +3328,10 @@ impl GitApp {
         }
         if self.compare.is_some() {
             self.compare_panel(ui, inner);
+            return;
+        }
+        if self.stash_view.is_some() {
+            self.stash_panel(ui, inner);
             return;
         }
         if self.sel == Sel::Wip && self.file_view.as_ref().is_some_and(|f| f.rev.is_none()) {
@@ -3350,9 +3481,26 @@ impl GitApp {
         let columns = self.columns(r);
         let (mut area, diff_area) = if columns { self.split_columns(ui, r) } else { (r, Rect::default()) };
         let head = area.take_top(44.0);
-        ui.p.text(head.x + 16.0, head.cy(), UI, 15.0, "Working copy", theme::TEXT);
+        let tw = ui.p.text(head.x + 16.0, head.cy(), UI, 15.0, "Working copy", theme::TEXT);
         let bw = ui.p.measure(UI, 12.0, &self.head_name);
         ui.p.text(head.right() - 16.0 - bw, head.cy(), UI, 12.0, &self.head_name, theme::DIM);
+        // Stashing: a button to stash, and the stash list only once there's something in it.
+        let mut bx = head.right() - 16.0 - bw - 12.0;
+        let n_stash = self.stashes.len();
+        let buttons = [(n_stash > 0, format!("Stashes · {n_stash}"), true), (!self.changes.is_empty(), "Stash…".to_string(), false)];
+        for (show, label, list) in buttons {
+            let w = ui.p.measure(UI, 12.0, &label) + 18.0;
+            if !show || bx - w < head.x + 16.0 + tw + 12.0 {
+                continue;
+            }
+            bx -= w;
+            let b = Rect::new(bx, head.cy() - 12.0, w, 24.0);
+            if ui.button(b, &label, false, true) {
+                let (title, items) = if list { ("Stashes", self.stash_list_items()) } else { ("Stash", self.stash_menu_items()) };
+                self.menu = Some(Menu::new((b.x, b.bottom() + 4.0), title.into(), None, items));
+            }
+            bx -= 6.0;
+        }
 
         let n_unstaged = self.changes.iter().filter(|c| c.unstaged() && !c.conflicted()).count();
         let n_staged = self.changes.iter().filter(|c| c.staged() && !c.conflicted()).count();
@@ -3532,6 +3680,153 @@ impl GitApp {
     }
 
     /// Subject, hash, author, date, parents and (up to `max_body` lines of) the message.
+    /// Shows a stash in the right-hand panel, over the selection until it's closed.
+    fn open_stash(&mut self, hash: &str) {
+        let Some(repo) = &self.repo else { return };
+        let Some(st) = self.stashes.iter().find(|s| s.hash == hash) else { return };
+        let files = match repo.stash_diff(&st.name, &self.opts) {
+            Ok(f) => f,
+            Err(e) => {
+                self.toast_err(e);
+                return;
+            }
+        };
+        Self::replace_diff(&mut self.diff, DiffView::new(files, DiffMode::Commit, format!("stash:{hash}")));
+        if self.stash_view.as_deref() != Some(hash) {
+            self.files_scroll = Scroll::default();
+            self.file_cursor = 0;
+        }
+        self.stash_view = Some(hash.to_string());
+        self.compare = None;
+        self.file_view = None;
+        if self.focus == Focus::Message {
+            self.focus = Focus::None;
+        }
+    }
+
+    /// Back to what's selected.
+    fn close_stash(&mut self) {
+        if self.stash_view.take().is_none() {
+            return;
+        }
+        self.reload_diff();
+        if self.pane == Pane::Stash {
+            self.pane = if self.sel == Sel::Wip { Pane::Files } else { Pane::Commits };
+        }
+    }
+
+    /// The ways to stash the working copy (the Stash button, S in the files).
+    fn stash_menu_items(&self) -> Vec<MenuItem> {
+        let staged = self.changes.iter().any(Change::staged);
+        let mut items = Vec::new();
+        for (kind, keys) in [
+            (StashKind::Changes, &["a"]),
+            (StashKind::WithUntracked, &["U"]),
+            (StashKind::Staged, &["s"]),
+            (StashKind::KeepIndex, &["i"]),
+        ] {
+            if matches!(kind, StashKind::Staged | StashKind::KeepIndex) && !staged {
+                continue;
+            }
+            let mut it = item(format!("Stash {}…", kind.what()), Act::PromptStash(kind));
+            it.keys = keys;
+            items.push(it);
+        }
+        if !self.stashes.is_empty() {
+            items.push(sep());
+            let mut it = item(format!("Stashes ({})…", self.stashes.len()), Act::StashList);
+            it.keys = &["5"];
+            items.push(it);
+        }
+        items
+    }
+
+    /// The stash list; picking one shows it.
+    fn stash_list_items(&self) -> Vec<MenuItem> {
+        self.stashes
+            .iter()
+            .map(|st| {
+                let (branch, msg) = st.parts();
+                let mut it = item(msg, Act::OpenStash(st.hash.clone()));
+                let on = if branch.is_empty() { String::new() } else { format!(" · {branch}") };
+                it.detail = format!("{}{on} · {}", st.name, git::short_age(st.time));
+                it
+            })
+            .collect()
+    }
+
+    /// A stash: what it is, what can be done with it, then its files and diff.
+    fn stash_panel(&mut self, ui: &mut Ui, r: Rect) {
+        let Some(st) = self.stash_view.as_ref().and_then(|h| self.stashes.iter().find(|s| &s.hash == h)).cloned() else {
+            ui.p.text(r.x + 16.0, r.y + 24.0, UI, 13.0, "This stash is gone", theme::FAINT);
+            return;
+        };
+        let columns = self.columns(r);
+        let (mut area, main) = if columns { self.split_columns(ui, r) } else { (r, Rect::default()) };
+        let head = area.take_top(114.0);
+        let (pad, (branch, message)) = (16.0, st.parts());
+        let age = git::rel_time(st.time);
+        let aw = ui.p.measure(UI, 12.0, &age);
+        ui.p.text_fit(head.x + pad, head.y + 24.0, head.w - 3.0 * pad - aw, UI, 15.5, message, theme::TEXT);
+        ui.p.text(head.right() - pad - aw, head.y + 24.0, UI, 12.0, &age, theme::FAINT);
+        let cy = head.y + 52.0;
+        let nw = ui.p.measure(MONO, 11.5, &st.name) + 14.0;
+        ui.p.rounded(Rect::new(head.x + pad, cy - 10.0, nw, 20.0), 5.0, theme::RAISED);
+        ui.p.text(head.x + pad + 7.0, cy, MONO, 11.5, &st.name, theme::ORANGE);
+        if !branch.is_empty() {
+            ui.p.text_fit(head.x + pad + nw + 10.0, cy, head.w - nw - 3.0 * pad, UI, 12.0, &format!("stashed on {branch}"), theme::DIM);
+        }
+        let by = head.y + 74.0;
+        let mut bx = head.x + pad;
+        let mut act = None;
+        let h = st.hash.clone();
+        for (label, a, primary, danger) in [
+            ("Apply", Act::ApplyStash(h.clone()), true, false),
+            ("Pop", Act::PopStash(h.clone()), false, false),
+            ("New branch…", Act::PromptStashBranch(h.clone()), false, false),
+            ("Rename…", Act::PromptStashRename(h.clone()), false, false),
+            ("Drop", Act::DropStash(h.clone()), false, true),
+        ] {
+            let w = ui.p.measure(UI, 12.5, label) + 22.0;
+            if bx + w > head.right() - pad - 64.0 {
+                break;
+            }
+            let b = Rect::new(bx, by, w, 26.0);
+            if if danger { ui.danger_button(b, label) } else { ui.button(b, label, primary, true) } {
+                act = Some(a);
+            }
+            bx += w + 6.0;
+        }
+        if ui.button(Rect::new(head.right() - pad - 58.0, by, 58.0, 26.0), "Close", false, true) {
+            self.close_stash();
+            return;
+        }
+        ui.p.rect(Rect::new(head.x, head.bottom() - 1.0, head.w, 1.0), theme::BORDER);
+        self.changes_tab(ui, area, columns.then_some(main));
+        if let Some(a) = act {
+            self.act(a);
+        }
+    }
+
+    fn apply_stash(&mut self, hash: &str, pop: bool) {
+        let Some(repo) = &self.repo else { return };
+        let Some(st) = self.stashes.iter().find(|s| s.hash == hash).cloned() else { return };
+        let r = repo.git(&["stash", if pop { "pop" } else { "apply" }, &st.name]);
+        let conflicted = repo.status().is_ok_and(|c| c.iter().any(Change::conflicted));
+        match r {
+            Ok(_) => self.toast_ok(format!("{} {}", if pop { "Popped" } else { "Applied" }, st.name)),
+            Err(_) if conflicted => {
+                let kept = if pop { " (the stash is kept)" } else { "" };
+                self.toast_err(format!("{} brought conflicts — resolve them in the working copy{kept}", st.name));
+            }
+            Err(e) => self.toast_err(e),
+        }
+        // Over to the working copy, to see what came back.
+        self.select(Sel::Wip);
+        self.pane = Pane::Files;
+        self.reload_all(false);
+    }
+
     fn commit_header(&mut self, ui: &mut Ui, area: &mut Rect, c: &Commit, max_body: usize) -> Option<String> {
         let pad = 16.0;
         let width = area.w - 2.0 * pad;
@@ -3961,7 +4256,7 @@ impl GitApp {
         let off = self.files_scroll.update(ui, list_r, nf as f32 * 22.0);
         self.list_view_h[0] = list_r.h;
         // The keyboard's file when it's driving this list, else the one the diff is showing.
-        let current = if self.kb && self.pane == Pane::Files { Some(self.file_cursor) } else { self.diff.current_file(split) };
+        let current = if self.kb && matches!(self.pane, Pane::Files | Pane::Stash) { Some(self.file_cursor) } else { self.diff.current_file(split) };
         let mut jump = None;
         ui.p.push_clip(list_r);
         for (fi, f) in self.diff.files.iter().enumerate() {
@@ -4129,6 +4424,33 @@ impl GitApp {
             self.palette.items = self.upstream_prompt_items(&branch, &q);
             return;
         }
+        if let Some(kind) = self.palette.stash_kind {
+            let label = if q.is_empty() { format!("Stash {}", kind.what()) } else { format!("Stash {} as “{q}”", kind.what()) };
+            let detail = if q.is_empty() { "or type a message first".to_string() } else { String::new() };
+            self.palette.items = vec![Item { label, detail, act: Act::Stash { kind, message: q }, score: 0, kind: "stash" }];
+            return;
+        }
+        if let Some(hash) = self.palette.stash_branch.clone() {
+            let name = self.stashes.iter().find(|s| s.hash == hash).map(|s| s.name.clone()).unwrap_or_default();
+            self.palette.items = if !valid_ref_name(&q) {
+                vec![]
+            } else if self.local_names.contains(&q) {
+                let act = Act::PromptStashBranch(hash);
+                vec![Item { label: format!("A branch named '{q}' already exists"), detail: "pick another name".into(), act, score: 0, kind: "branch" }]
+            } else {
+                let label = format!("Create branch '{q}' from {name} and switch to it");
+                vec![Item { label, detail: "git stash branch".into(), act: Act::StashBranch { hash, branch: q }, score: 0, kind: "new" }]
+            };
+            return;
+        }
+        if let Some(hash) = self.palette.stash_rename.clone() {
+            let name = self.stashes.iter().find(|s| s.hash == hash).map(|s| s.name.clone()).unwrap_or_default();
+            self.palette.items = match q.is_empty() {
+                true => vec![],
+                false => vec![Item { label: format!("Rename {name} to “{q}”"), detail: String::new(), act: Act::RenameStash { hash, message: q }, score: 0, kind: "stash" }],
+            };
+            return;
+        }
         if let Some(hash) = self.palette.reword_of.clone() {
             let short = hash[..8.min(hash.len())].to_string();
             self.palette.items = match q.is_empty() {
@@ -4183,6 +4505,8 @@ impl GitApp {
                 actions.push(("Swap compare sides", "A ⇄ B".into(), Act::CompareSwap));
                 actions.push(("Close comparison", "Esc".into(), Act::CompareClose));
             }
+            let bar = if self.key_bar { "Hide the key bar" } else { "Show the key bar" };
+            actions.push((bar, "keys for what has focus, at the bottom".into(), Act::ToggleKeyBar));
             actions.extend([
                 ("Toggle split / unified diff", "v".to_string(), Act::ToggleSplit),
                 ("Toggle wide diff view", "w · hides the graph".into(), Act::ToggleWide),
@@ -4211,6 +4535,16 @@ impl GitApp {
             if let Some(h) = self.sel_row().map(|i| self.commits[i].hash.clone()).or_else(|| self.repo.as_ref()?.rev_parse("HEAD")) {
                 actions.push(("New branch…", "from the selected commit · or just type a name".into(), Act::PromptBranchAt(h.clone())));
                 actions.push(("New tag…", "on the selected commit · or HEAD".into(), Act::PromptTagAt(h)));
+            }
+            if !self.changes.is_empty() {
+                actions.push(("Stash all changes…", "git stash · s".into(), Act::PromptStash(StashKind::Changes)));
+                actions.push(("Stash all changes and untracked files…", "git stash -u".into(), Act::PromptStash(StashKind::WithUntracked)));
+                if self.changes.iter().any(Change::staged) {
+                    actions.push(("Stash staged changes…", "git stash --staged".into(), Act::PromptStash(StashKind::Staged)));
+                }
+            }
+            if !self.stashes.is_empty() {
+                actions.push(("Stashes…", format!("{} · 5", self.stashes.len()), Act::StashList));
             }
             if let Some(it) = self.refs.iter().find(|r| r.kind == RefKind::Local && r.is_head).and_then(|r| self.upstream_item(r)) {
                 let label = if it.label.starts_with("Change") { "Change upstream of current branch…" } else { "Set upstream of current branch…" };
@@ -4258,6 +4592,12 @@ impl GitApp {
             let (remotes, upstream) = self.remotes_upstream_first();
             let head = self.head_name.clone();
             let tags: Vec<&str> = self.refs.iter().filter(|r| r.kind == RefKind::Tag).map(|r| r.name.as_str()).collect();
+            for st in &self.stashes {
+                let msg = st.parts().1;
+                push(format!("Apply {}: {msg}", st.name), "keeps the stash".into(), Act::ApplyStash(st.hash.clone()), "stash", "", 2);
+                push(format!("Pop {}: {msg}", st.name), "applies and drops it".into(), Act::PopStash(st.hash.clone()), "stash", "", 1);
+                push(format!("Show {}: {msg}", st.name), "its changes".into(), Act::OpenStash(st.hash.clone()), "stash", "", 1);
+            }
             for (name, url) in remotes {
                 let rbranch = upstream.as_ref().filter(|(r, _)| *r == name).map_or_else(|| head.clone(), |(_, b)| b.clone());
                 push(format!("Push {head} to {name}"), short_url(&url), Act::PushTo { remote: name.clone(), force: false }, "action", "", 25);
@@ -4524,6 +4864,9 @@ impl GitApp {
             None if self.palette.upstream_for.is_some() => format!("Remote branch for {} to track…", self.palette.upstream_for.as_deref().unwrap_or("")),
             None if self.palette.reword_of.is_some() => "New commit subject (the description stays)…".into(),
             None if self.palette.rename_of.is_some() => "New branch name…".into(),
+            None if self.palette.stash_kind.is_some() => "Stash message (optional)…".into(),
+            None if self.palette.stash_branch.is_some() => "Branch name for the stash…".into(),
+            None if self.palette.stash_rename.is_some() => "New stash message…".into(),
             None => "Type a command, branch, commit, or a path to open…".into(),
         };
         self.palette.input.draw(ui, input_r, &placeholder, true, false);
@@ -4557,6 +4900,7 @@ impl GitApp {
                 "remote" => theme::CYAN,
                 "commit" => theme::DIM,
                 "tag" => theme::YELLOW,
+                "stash" => theme::ORANGE,
                 _ => theme::GREEN,
             };
             let kw = ui.p.measure(UI, 10.0, item.kind) + 12.0;
@@ -5038,13 +5382,13 @@ impl GitApp {
         }
         let Some(m) = &self.menu else { return };
         let row_h = MENU_ROW_H;
-        // An item's own key, as a key cap (unless its detail already lists the keys).
-        let cap = |it: &MenuItem| it.keys.first().copied().filter(|_| it.detail != it.keys.join("  "));
+        // An item's keys, as key caps (a few at most).
+        let caps = |it: &MenuItem| it.keys.iter().take(3).map(|k| keys::pretty(k)).collect::<Vec<_>>();
         let cap_w = |ui: &mut Ui, k: &str| ui.p.measure(MONO, 11.0, k) + 12.0;
         let mut w: f32 = ui.p.measure(UI, 11.5, &m.title).min(380.0) + 32.0;
         for it in &m.items {
             let dw = if it.detail.is_empty() { 0.0 } else { ui.p.measure(UI, 11.5, &it.detail) + 24.0 };
-            let kw = cap(it).map_or(0.0, |k| cap_w(ui, k) + 10.0);
+            let kw: f32 = caps(it).iter().map(|k| cap_w(ui, k) + 6.0).sum::<f32>() + if it.keys.is_empty() { 0.0 } else { 4.0 };
             w = w.max(ui.p.measure(UI, 13.0, &it.label) + 40.0 + dw + kw);
         }
         if let Some((n, _)) = &m.note {
@@ -5105,12 +5449,15 @@ impl GitApp {
                     }
                     let fg = if it.danger { theme::RED } else { theme::TEXT };
                     let mut right = row.right() - 10.0;
-                    if let Some(k) = cap(it) {
+                    for k in caps(it).iter().rev() {
                         let kw = cap_w(ui, k);
                         let kr = Rect::new(right - kw, row.cy() - 9.0, kw, 18.0);
                         ui.p.rounded_stroke(kr, 4.0, 1.0, theme::BORDER.mix(theme::TEXT, 0.2));
                         ui.p.text(kr.x + 6.0, kr.cy(), MONO, 11.0, k, theme::DIM);
-                        right = kr.x - 10.0;
+                        right = kr.x - 6.0;
+                    }
+                    if !it.keys.is_empty() {
+                        right -= 4.0;
                     }
                     let dw = if it.detail.is_empty() { 0.0 } else { ui.p.measure(UI, 11.5, &it.detail).min(row.w * 0.6) };
                     ui.p.text_fit(row.x + 10.0, row.cy(), right - row.x - 20.0 - dw, UI, 13.0, &it.label, fg);
@@ -5312,7 +5659,8 @@ impl GitApp {
         let max_w = (s.w * 0.5).max(300.0);
         let undo_w = if has_undo { 64.0 } else { 0.0 };
         let w = (ui.p.measure(UI, 12.5, &msg) + 44.0 + undo_w).min(max_w);
-        let r = Rect::new(s.right() - w - 20.0, s.bottom() - 58.0, w, 38.0);
+        let above_bar = if self.key_bar && self.repo.is_some() { KEY_BAR_H } else { 0.0 };
+        let r = Rect::new(s.right() - w - 20.0, s.bottom() - 58.0 - above_bar, w, 38.0);
         let c = if err { theme::RED } else { theme::GREEN };
         ui.p.rounded(Rect::new(r.x, r.y + 3.0, r.w, r.h), 10.0, Color::hex(0x000000).alpha(0.35));
         ui.p.rounded(r, 10.0, theme::RAISED);
@@ -6125,7 +6473,7 @@ mod tests {
         assert_eq!(index(&h, "one"), "one, changed");
         assert_eq!(h.app.wip_file, Some(("two".to_string(), false)));
 
-        // enter: line by line in the diff of "a".
+        // enter: into the diff of "a", the cursor on its first change, nothing selected yet.
         h.keys("k <enter>");
         assert!(h.app.pane == Pane::Main);
         let lines = |h: &Harness| {
@@ -6133,27 +6481,35 @@ mod tests {
             v.sort();
             v
         };
-        assert_eq!(lines(&h), ["-line 2"]);
-        h.keys("j");
-        assert_eq!(lines(&h), ["+line 2!"]);
-        h.keys("<space>");
-        // Just the added line went in; the cursor is on what's next.
+        let at = |h: &Harness| h.app.diff.cursor.map(|(f, hk, l)| h.app.diff.files[f].hunks[hk].lines[l].clone());
+        assert_eq!((at(&h).as_deref(), lines(&h).len()), (Some("-line 2"), 0));
+        // s with nothing selected stages the line under the cursor; the next one slides in.
+        h.keys("j s");
         assert!(index(&h, "a").contains("line 2\nline 2!\nline 3"), "{}", index(&h, "a"));
-        assert_eq!(lines(&h), ["-line 10"]);
-        // a: the whole hunk; v: a range.
+        assert_eq!(at(&h).as_deref(), Some("-line 10"));
+        // a selects the hunk (again: unselects); space a line, and moving doesn't change that.
         h.keys("a");
         assert_eq!(lines(&h), ["+line 10!", "-line 10"]);
-        h.keys("a k");
+        h.keys("a k <space> j");
         assert_eq!(lines(&h), ["-line 2"]);
-        h.keys("v j");
+        h.keys("<space>");
         assert_eq!(lines(&h), ["-line 10", "-line 2"]);
-        // d discards the range from the file (undoable).
+        // d discards the selection from the file (undoable).
         h.keys("d");
         let file = std::fs::read_to_string(dir.join("a")).unwrap();
         assert!(file.starts_with("line 1\nline 2\nline 2!\nline 3\n") && file.contains("line 9\nline 10\nline 10!\nline 11"), "{file}");
         h.keys("z");
         assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), edited.join("\n") + "\n");
+        // shift-↓ selects while moving; esc clears the selection, then leaves the diff.
+        h.keys("< <s-down>");
+        assert_eq!(lines(&h), ["-line 10", "-line 2"]);
         h.keys("<esc>");
+        assert!(h.app.pane == Pane::Main && lines(&h).is_empty());
+        // v is split / unified here too.
+        let before = h.app.layout;
+        h.keys("v");
+        assert!(h.app.layout != before);
+        h.keys("v <esc>");
         assert!(h.app.pane == Pane::Files && h.app.diff.cursor.is_none());
 
         // a stages everything; c and a summary (the 'c' isn't typed into it), tab to write a
@@ -6195,7 +6551,7 @@ mod tests {
         h.keys("?");
         let m = h.app.menu.as_ref().unwrap();
         assert_eq!(m.title, "Keys · Commits");
-        assert!(m.items.iter().any(|i| i.label == "Squash into the commit below" && i.detail == "s"));
+        assert!(m.items.iter().any(|i| i.label == "Squash into the commit below" && i.keys == ["s"]));
         h.keys("<esc>");
         assert!(h.app.menu.is_none());
 
@@ -6210,7 +6566,7 @@ mod tests {
         assert_eq!(subjects(), ["four", "three", "two", "one"]);
 
         // g: the reset menu, with lazygit's s / m / h keys. (< is the top row: the working copy.)
-        h.keys("4 < j j j");
+        h.keys("2 < j j j");
         assert_eq!(h.app.selected.as_ref().unwrap().subject, "two");
         h.keys("g");
         assert_eq!(h.menu_labels(), ["Soft reset", "Mixed reset", "Hard reset"]);
@@ -6249,8 +6605,8 @@ mod tests {
         let mut h = Harness::new(&dir);
         let head = || git(&["symbolic-ref", "--short", "HEAD"]).trim().to_string();
 
-        // 3: the branch list, on the current branch. Moving shows the branch's commit.
-        h.keys("3");
+        // 1: the sidebar, on the current branch. Moving shows the branch's commit.
+        h.keys("1");
         assert!(h.app.pane == Pane::Branches);
         assert_eq!(h.app.side_cursor, Some(SideKey::Ref("refs/heads/main".into())));
         h.keys("k");
@@ -6287,6 +6643,98 @@ mod tests {
         h.keys("<enter>");
         assert!(h.app.pane == Pane::Commits);
         assert_eq!(h.app.selected.as_ref().unwrap().subject, "feature work");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stash_with_lazygit_keys() {
+        let dir = temp_repo("kb-stash");
+        let git = |args: &[&str]| git::run(&dir, args, None).unwrap();
+        std::fs::write(dir.join("one"), "one, changed").unwrap();
+        let mut h = Harness::new(&dir);
+        let subjects = || git(&["stash", "list", "--format=%gs"]).lines().map(String::from).collect::<Vec<_>>();
+        let read = || std::fs::read_to_string(dir.join("one")).unwrap();
+
+        // s: a message, enter stashes; z brings the changes back.
+        assert!(h.app.pane == Pane::Files);
+        h.keys("s");
+        assert!(h.app.palette.stash_kind == Some(StashKind::Changes));
+        h.type_text("half done");
+        h.keys("<enter>");
+        assert_eq!(subjects(), ["On main: half done"]);
+        assert_eq!(read(), "one");
+        h.keys("z");
+        assert!(subjects().is_empty());
+        assert_eq!(read(), "one, changed");
+        // S: the ways to stash, with lazygit's keys.
+        h.keys("S");
+        assert_eq!(h.menu_labels(), ["Stash all changes…", "Stash all changes and untracked files…"]);
+        h.keys("a <enter>");
+        assert_eq!(subjects().len(), 1);
+        assert!(subjects()[0].starts_with("WIP on main"), "git's message when none is given");
+
+        // 5: the stash list; enter shows one, its keys work there.
+        h.keys("5");
+        assert_eq!(h.app.menu.as_ref().unwrap().title, "Stashes");
+        h.keys("<enter>");
+        assert!(h.app.stash_view.is_some() && h.app.pane == Pane::Stash);
+        assert_eq!(h.app.diff.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["one"]);
+        h.keys("<enter>");
+        assert!(h.app.pane == Pane::Main && h.app.diff.cursor.is_some());
+        h.keys("<esc>");
+        assert!(h.app.pane == Pane::Stash);
+        h.keys("r");
+        h.app.palette.input.set("renamed");
+        h.frame();
+        h.keys("<enter>");
+        assert_eq!(subjects(), ["On main: renamed"]);
+        h.keys("z");
+        assert!(subjects()[0].starts_with("WIP on main"));
+        // space applies (the stash stays); d drops it, z puts it back; g pops it.
+        h.keys("5 <enter> <space>");
+        assert_eq!((read().as_str(), subjects().len()), ("one, changed", 1));
+        assert!(h.app.stash_view.is_none() && h.app.pane == Pane::Files, "back to the working copy");
+        git(&["checkout", "--", "one"]);
+        h.app.reload_all(false);
+        h.keys("5 <enter> d");
+        assert_eq!(h.menu_labels(), ["Drop stash@{0}"]);
+        h.keys("<enter>");
+        assert!(subjects().is_empty() && h.app.stash_view.is_none());
+        h.keys("z");
+        assert_eq!(subjects().len(), 1);
+        h.keys("5 <enter> g");
+        assert_eq!((read().as_str(), subjects().len()), ("one, changed", 0));
+        // n: a branch from a stash.
+        h.keys("s <enter> 5 <enter> n");
+        h.app.palette.input.set("from-stash");
+        h.frame();
+        h.keys("<enter>");
+        assert_eq!(git(&["symbolic-ref", "--short", "HEAD"]).trim(), "from-stash");
+        assert_eq!((read().as_str(), subjects().len()), ("one, changed", 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn key_bar_follows_what_has_the_keys() {
+        let dir = temp_repo("keybar-app");
+        std::fs::write(dir.join("one"), "changed").unwrap();
+        let mut h = Harness::new(&dir);
+        let labels = |h: &Harness| h.app.key_bar_entries().0.into_iter().map(|e| e.1).collect::<Vec<_>>();
+        assert!(labels(&h).starts_with(&["stage".to_string(), "all".into(), "lines".into(), "discard".into()]), "{:?}", labels(&h));
+        // In the diff: selecting and staging lines.
+        h.keys("<enter>");
+        let l = labels(&h);
+        assert!(l.contains(&"select".to_string()) && l.contains(&"stage".to_string()) && l.contains(&"back".to_string()), "{l:?}");
+        // Commit keys only where there's a commit: none on the working copy's row.
+        h.keys("2 <");
+        assert!(!labels(&h).contains(&"reword".to_string()));
+        h.keys("j");
+        assert!(labels(&h).contains(&"reword".to_string()));
+        // The palette and the message box have their own.
+        h.keys("/");
+        assert_eq!(labels(&h), ["move", "run", "close"]);
+        h.keys("<esc> c");
+        assert_eq!(labels(&h)[..2], ["commit".to_string(), "description".into()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
