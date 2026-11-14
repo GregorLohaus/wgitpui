@@ -811,17 +811,36 @@ impl Repo {
     /// Runs `git rebase -i` non-interactively with a prepared todo list.
     /// `base` is the commit to rebase onto; None means `--root`.
     pub fn rebase_with_todo(&self, base: Option<&str>, todo: &str) -> Result<String, String> {
+        self.rebase_todo(base, todo, None)
+    }
+
+    /// `rebase_with_todo` where the todo rewords a commit to `message`.
+    pub fn reword_with_todo(&self, base: Option<&str>, todo: &str, message: &str) -> Result<String, String> {
+        self.rebase_todo(base, todo, Some(message))
+    }
+
+    fn rebase_todo(&self, base: Option<&str>, todo: &str, message: Option<&str>) -> Result<String, String> {
+        let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
         let todo_path = self.git_path("wgitpui-rebase-todo");
         std::fs::write(&todo_path, todo).map_err(|e| e.to_string())?;
-        let quoted = format!("'{}'", todo_path.display().to_string().replace('\'', "'\\''"));
-        let editor = format!("cp {quoted}");
+        let editor = format!("cp {}", quote(&todo_path));
+        // Git hands the editor the message file: copying ours over it is the edit.
+        let msg_path = self.git_path("wgitpui-reword-msg");
+        let msg_editor = match message {
+            Some(m) => {
+                std::fs::write(&msg_path, m).map_err(|e| e.to_string())?;
+                format!("cp {}", quote(&msg_path))
+            }
+            None => "true".to_string(),
+        };
         let mut args = vec!["-c", "rebase.autoSquash=false", "-c", "rebase.updateRefs=false", "rebase", "-i", "--autostash"];
         match base {
             Some(b) => args.push(b),
             None => args.push("--root"),
         }
-        let r = self.git_env(&args, &[("GIT_SEQUENCE_EDITOR", &editor), ("GIT_EDITOR", "true")]);
+        let r = self.git_env(&args, &[("GIT_SEQUENCE_EDITOR", &editor), ("GIT_EDITOR", &msg_editor)]);
         let _ = std::fs::remove_file(&todo_path);
+        let _ = std::fs::remove_file(&msg_path);
         r
     }
 

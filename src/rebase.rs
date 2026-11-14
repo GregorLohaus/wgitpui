@@ -18,6 +18,8 @@ pub enum RebaseOp {
     /// Place it directly below (older than) the target.
     Below,
     /// Fold it into the target, keeping the target's message (`fixup`).
+    Fixup,
+    /// Fold it into the target, keeping both messages (`squash`).
     Squash,
     /// Remove it from history.
     Drop,
@@ -55,7 +57,8 @@ pub fn plan(chain: &[ChainItem], src: usize, target: usize, op: RebaseOp) -> Opt
         match op {
             RebaseOp::Above => order.insert(t, item),
             RebaseOp::Below => order.insert(t + 1, item),
-            RebaseOp::Squash => order.insert(t, (item.0, "fixup")),
+            RebaseOp::Fixup => order.insert(t, (item.0, "fixup")),
+            RebaseOp::Squash => order.insert(t, (item.0, "squash")),
             RebaseOp::Drop => unreachable!(),
         }
         src.max(target)
@@ -74,7 +77,8 @@ pub fn plan(chain: &[ChainItem], src: usize, target: usize, op: RebaseOp) -> Opt
     }
     let label = match op {
         RebaseOp::Above | RebaseOp::Below => format!("move {}", quote(chain[src].subject)),
-        RebaseOp::Squash => format!("squash {} into {}", quote(chain[src].subject), quote(chain[target].subject)),
+        RebaseOp::Fixup => format!("squash {} into {}", quote(chain[src].subject), quote(chain[target].subject)),
+        RebaseOp::Squash => format!("squash {} into {} with its message", quote(chain[src].subject), quote(chain[target].subject)),
         RebaseOp::Drop => format!("drop {}", quote(chain[src].subject)),
     };
     Some(Plan { base: chain[deepest].parent.map(String::from), todo, label })
@@ -109,9 +113,9 @@ mod tests {
 
     #[test]
     fn squash_places_fixup_after_target() {
-        let p = plan(&chain(), 0, 2, RebaseOp::Squash).unwrap();
+        let p = plan(&chain(), 0, 2, RebaseOp::Fixup).unwrap();
         assert_eq!(p.todo, "pick c C\nfixup a A\npick b B\n");
-        let p = plan(&chain(), 2, 0, RebaseOp::Squash).unwrap();
+        let p = plan(&chain(), 2, 0, RebaseOp::Fixup).unwrap();
         assert_eq!(p.todo, "pick b B\npick a A\nfixup c C\n");
     }
 
@@ -153,7 +157,7 @@ mod tests {
             .iter()
             .map(|c| ChainItem { hash: &c.hash, subject: &c.subject, parent: c.parents.first().map(String::as_str) })
             .collect();
-        let p = plan(&items, 0, 3, RebaseOp::Squash).unwrap();
+        let p = plan(&items, 0, 3, RebaseOp::Fixup).unwrap();
         assert!(p.base.is_none());
         repo.rebase_with_todo(p.base.as_deref(), &p.todo).unwrap();
         assert_eq!(subjects(), ["two", "four", "one"]);

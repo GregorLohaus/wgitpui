@@ -6,6 +6,9 @@ use crate::fileview::{FileAction, FileView, TreeAction, TreeView};
 use crate::font::{MONO, UI};
 use crate::git::{self, Change, Commit, DiffOpts, LogMsg, MergePreview, OpKind, Ref, RefKind, Repo, Side, Worktree};
 use crate::graph::Graph;
+use crate::keys::{self, Cmd, Pane};
+
+mod keyboard;
 use crate::palette::{fuzzy, Act, Item, Palette, WtFrom};
 use crate::rebase::{self, ChainItem, RebaseOp};
 use crate::resolve::{ConflictDoc, ResolveAction};
@@ -88,6 +91,8 @@ struct MenuItem {
     /// None = separator.
     act: Option<Act>,
     danger: bool,
+    /// Keys that pick this item while the menu is open (lazygit-style).
+    keys: &'static [&'static str],
 }
 
 /// Right-click / drop context menu.
@@ -98,18 +103,51 @@ struct Menu {
     items: Vec<MenuItem>,
     /// The click that opened the menu must not also close it.
     fresh: bool,
+    /// Item highlighted from the keyboard (enter picks it).
+    sel: Option<usize>,
+    /// How far a menu taller than the window is scrolled, and how much of it shows.
+    scroll: f32,
+    view_h: f32,
+}
+
+const MENU_ROW_H: f32 = 30.0;
+
+impl Menu {
+    fn new(at: (f32, f32), title: String, note: Option<(String, Color)>, items: Vec<MenuItem>) -> Menu {
+        Menu { at, title, note, items, fresh: true, sel: None, scroll: 0.0, view_h: f32::MAX }
+    }
+
+    /// Scrolls the highlighted item into view.
+    fn reveal_sel(&mut self) {
+        let Some(sel) = self.sel else { return };
+        let y0: f32 = self.items[..sel].iter().map(|i| if i.act.is_some() { MENU_ROW_H } else { 9.0 }).sum();
+        if y0 < self.scroll {
+            self.scroll = y0;
+        } else if y0 + MENU_ROW_H > self.scroll + self.view_h {
+            self.scroll = y0 + MENU_ROW_H - self.view_h;
+        }
+    }
+}
+
+/// A row of the sidebar, for its keyboard cursor.
+#[derive(Clone, Debug, PartialEq)]
+enum SideKey {
+    Wip,
+    Worktree(PathBuf),
+    /// A ref by its full name.
+    Ref(String),
 }
 
 fn item(label: impl Into<String>, act: Act) -> MenuItem {
-    MenuItem { label: label.into(), detail: String::new(), act: Some(act), danger: false }
+    MenuItem { label: label.into(), detail: String::new(), act: Some(act), danger: false, keys: &[] }
 }
 
 fn danger(label: impl Into<String>, act: Act) -> MenuItem {
-    MenuItem { label: label.into(), detail: String::new(), act: Some(act), danger: true }
+    MenuItem { label: label.into(), detail: String::new(), act: Some(act), danger: true, keys: &[] }
 }
 
 fn sep() -> MenuItem {
-    MenuItem { label: String::new(), detail: String::new(), act: None, danger: false }
+    MenuItem { label: String::new(), detail: String::new(), act: None, danger: false, keys: &[] }
 }
 
 /// A branch label being dragged onto another branch.
@@ -306,6 +344,24 @@ pub struct GitApp {
     remote_btns: [(f32, f32); 3],
     /// Recently opened repositories (for the palette), provided by the workspace.
     pub recent: Vec<PathBuf>,
+    // Keyboard (lazygit-style).
+    /// The pane keys go to, and whether the keyboard is driving (then a ring shows it).
+    pane: Pane,
+    kb: bool,
+    /// Where each pane was drawn last frame: clicks focus them, the ring goes around them.
+    pane_rects: Vec<(Pane, Rect)>,
+    /// The sidebar's keyboard cursor, and each sidebar row's content y at the last frame.
+    side_cursor: Option<SideKey>,
+    side_rows: Vec<(SideKey, f32)>,
+    side_view_h: f32,
+    /// Keyboard cursor in a commit's file list.
+    file_cursor: usize,
+    /// Visible heights of the unstaged and staged lists at the last frame.
+    list_view_h: [f32; 2],
+    /// Commits copied for cherry-picking (C), pasted by V.
+    copied: Vec<String>,
+    /// Where the diff (with its toolbar) was drawn this frame.
+    main_rect: Option<Rect>,
 }
 
 impl GitApp {
@@ -377,6 +433,16 @@ impl GitApp {
             close_requests: vec![],
             remote_btns: [(f32::MAX, TOP_H + 6.0); 3],
             recent: vec![],
+            pane: Pane::Commits,
+            kb: false,
+            pane_rects: vec![],
+            side_cursor: None,
+            side_rows: vec![],
+            side_view_h: 400.0,
+            file_cursor: 0,
+            list_view_h: [LIST_ROW_H * 7.0; 2],
+            copied: vec![],
+            main_rect: None,
         };
         let path = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         app.open(path);
@@ -408,6 +474,9 @@ impl GitApp {
                         self.select(Sel::Commit(h));
                     }
                 }
+                // Like lazygit: the files when there are changes, else the commits.
+                self.pane = if self.sel == Sel::Wip { Pane::Files } else { Pane::Commits };
+                self.copied.clear();
             }
             Err(e) => {
                 if self.repo.is_some() {
@@ -931,7 +1000,12 @@ impl GitApp {
 
     fn replace_diff(old: &mut DiffView, mut view: DiffView) {
         if view.key == old.key {
-            view.keep_selection(old);
+            // Keyboard staging goes on from the same place; a mouse selection carries over as is.
+            if old.cursor.is_some() && old.kb_focus {
+                view.keep_cursor(old);
+            } else {
+                view.keep_selection(old);
+            }
             view.scroll = std::mem::take(&mut old.scroll);
             view.hscroll = old.hscroll;
             if !old.collapsed.is_empty() {
@@ -1301,7 +1375,8 @@ impl GitApp {
                 }
             }
             Act::MoveCommit(up) => self.keyboard_rebase(if up { RebaseOp::Above } else { RebaseOp::Below }),
-            Act::SquashIntoParent => self.keyboard_rebase(RebaseOp::Squash),
+            Act::SquashIntoParent => self.keyboard_rebase(RebaseOp::Fixup),
+            Act::SquashWithMessage => self.keyboard_rebase(RebaseOp::Squash),
             Act::DropCommit => self.keyboard_rebase(RebaseOp::Drop),
             Act::OpContinue => {
                 if let Some(op) = self.op {
@@ -1468,6 +1543,82 @@ impl GitApp {
                 self.spawn(&format!("Pushing tag {t} to {remote}"), own(&["push", &remote, &format!("refs/tags/{t}")]));
             }
             Act::PushTag { tag: None, remote } => self.spawn(&format!("Pushing tags to {remote}"), own(&["push", &remote, "--tags"])),
+            Act::Key(cmd) => self.run_cmd(cmd),
+            Act::CopyText(text) => {
+                crate::clipboard::copy(&text);
+                let shown: String = text.lines().next().unwrap_or("").chars().take(60).collect();
+                self.toast_ok(format!("Copied {shown}"));
+            }
+            Act::PromptReword(hash) => {
+                // The subject is what's edited here; the body stays as it is.
+                let subject = self.commits.iter().find(|c| c.hash == hash).map(|c| c.subject.clone()).unwrap_or_default();
+                self.focus = Focus::Palette;
+                self.palette.reset(&subject);
+                self.palette.reword_of = Some(hash);
+            }
+            Act::Reword { hash, message } => self.reword(&hash, &message),
+            Act::PromptRename(branch) => {
+                self.focus = Focus::Palette;
+                self.palette.reset(&branch);
+                self.palette.rename_of = Some(branch);
+            }
+            Act::RenameBranch { from, to } => {
+                let r = repo.git(&["branch", "-m", &from, &to]);
+                if self.result(r, "") {
+                    self.push_undo(Undo::Cmd { args: own(&["branch", "-m", &to, &from]), label: format!("rename {from} to {to}") });
+                }
+                self.reload_all(false);
+            }
+            Act::Amend => {
+                if !self.changes.iter().any(Change::staged) {
+                    self.toast_err("Nothing staged to amend with");
+                    return;
+                }
+                let Some(old) = repo.rev_parse("HEAD") else { return };
+                let r = repo.git(&["commit", "--amend", "--no-edit"]);
+                if self.result(r, "") {
+                    self.push_undo(Undo::Reset { to: old, soft: true, label: "amend".into() });
+                }
+                self.reload_all(false);
+            }
+            Act::CherryPickMany(hashes) => {
+                let n = hashes.len();
+                let undo = self.branch_undo(None, None, format!("cherry-pick {n} commit{}", if n == 1 { "" } else { "s" }));
+                let mut args = vec!["cherry-pick"];
+                args.extend(hashes.iter().map(String::as_str));
+                let r = self.repo.as_ref().unwrap().git(&args);
+                if r.is_ok() {
+                    self.copied.clear();
+                }
+                self.after_op(r, "Cherry-picked", "Cherry-pick", undo);
+            }
+            Act::DiscardStaged(path) => {
+                let done = repo.diff_file(&path, true, &DiffOpts::default()).and_then(|files| {
+                    let f = files.into_iter().next().filter(|f| !f.hunks.is_empty()).ok_or(format!("{path} has no staged lines to discard"))?;
+                    let all: Vec<usize> = (0..f.hunks.len()).collect();
+                    repo.discard_staged(&f, &all, None)
+                });
+                match done {
+                    Ok((index, worktree)) => {
+                        let steps = vec![Undo::IndexPatch { patch: index, label: String::new() }, Undo::Patch { patch: worktree, label: String::new() }];
+                        self.push_undo(Undo::Many(steps, format!("discard staged changes to {path}")));
+                    }
+                    Err(e) => self.toast_err(e),
+                }
+                self.reload_status();
+            }
+            Act::DiscardFile(path) => {
+                match self.discard_file(&path) {
+                    Ok(u) => self.push_undo(u),
+                    Err(e) => self.toast_err(e),
+                }
+                self.reload_status();
+            }
+            Act::CheckoutPrev => {
+                let r = repo.git(&["switch", "-"]);
+                self.result(r, "Switched to the previous branch");
+                self.reload_all(false);
+            }
             Act::DeleteTag(name) => {
                 let Some(id) = repo.rev_parse(&format!("refs/tags/{name}")) else { return };
                 let r = repo.git(&["tag", "-d", &name]);
@@ -1835,13 +1986,56 @@ impl GitApp {
         };
         let target = match op {
             RebaseOp::Above => pos.checked_sub(1),
-            RebaseOp::Below | RebaseOp::Squash => (pos + 1 < chain.len()).then_some(pos + 1),
+            RebaseOp::Below | RebaseOp::Fixup | RebaseOp::Squash => (pos + 1 < chain.len()).then_some(pos + 1),
             RebaseOp::Drop => Some(pos),
         };
         match target {
             Some(t) => self.run_rebase(row, chain[t], op),
             None => self.toast_err("Nothing to move past"),
         }
+    }
+
+    /// A commit's new subject (its body stays): HEAD is amended (only the message); an older
+    /// commit of the current branch gets rewritten by an interactive rebase.
+    fn reword(&mut self, hash: &str, subject: &str) {
+        let Some(repo) = &self.repo else { return };
+        let full = repo.git(&["log", "-1", "--format=%B", hash]).unwrap_or_default();
+        let body = full.trim_end().split_once('\n').map_or("", |(_, b)| b.trim_start_matches('\n'));
+        let message = if body.is_empty() { subject.to_string() } else { format!("{subject}\n\n{body}") };
+        let Some(old) = repo.rev_parse("HEAD") else { return };
+        let label = format!("reword {}", &hash[..8.min(hash.len())]);
+        if old == hash {
+            let r = repo.git(&["commit", "--amend", "--only", "-m", &message]);
+            if self.result(r, "") {
+                self.push_undo(Undo::Reset { to: old, soft: true, label });
+            }
+            self.reload_all(false);
+            return;
+        }
+        if let Some(op) = self.op {
+            self.toast_err(format!("A {} is in progress — continue or abort it first", op.name().to_lowercase()));
+            return;
+        }
+        let chain = self.rebase_chain();
+        let Some(pos) = self.hash_index.get(hash).and_then(|r| chain.iter().position(|c| c == r)) else {
+            self.toast_err("Only commits on the current branch (above any merge) can be reworded");
+            return;
+        };
+        let todo: String = chain[..=pos]
+            .iter()
+            .rev()
+            .map(|&r| {
+                let c = &self.commits[r];
+                format!("{} {} {}\n", if r == chain[pos] { "reword" } else { "pick" }, c.hash, c.subject)
+            })
+            .collect();
+        let base = self.commits[chain[pos]].parents.first().cloned();
+        let repo = self.repo.as_ref().unwrap();
+        match repo.reword_with_todo(base.as_deref(), &todo, &message) {
+            Ok(_) => self.push_undo(Undo::Reset { to: old, soft: false, label }),
+            Err(e) => self.toast_err(e),
+        }
+        self.reload_all(false);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1885,6 +2079,9 @@ impl GitApp {
         self.poll_wt_jobs(ui);
         self.tick_playback(ui);
         self.global_keys(ui);
+        self.click_focus(ui);
+        self.pane_rects.clear();
+        self.diff.kb_focus = self.kb && self.pane == Pane::Main && self.focus == Focus::None;
 
         let mut area = bounds;
         ui.p.rect(area, theme::BG);
@@ -1906,14 +2103,17 @@ impl GitApp {
             } else {
                 let side = area.take_left(SIDEBAR_W);
                 self.sidebar(ui, side);
+                self.pane_rects.push((Pane::Branches, side));
                 let rw = self.right_w.unwrap_or((area.w * 0.48).max(420.0)).clamp(320.0, (area.w - 360.0).max(320.0));
                 let right = area.take_right(rw);
                 self.splitter(ui, right, area.w + rw);
                 self.graph_view(ui, area);
+                self.pane_rects.push((Pane::Commits, area));
                 self.detail(ui, right);
             }
         }
         ui.blocked = false;
+        self.draw_focus(ui);
         self.branch_drag(ui);
         if self.menu.is_some() {
             self.draw_menu(ui);
@@ -1988,67 +2188,21 @@ impl GitApp {
         if self.focus == Focus::Message && ui.input.take_key(Key::Escape, false).is_some() {
             self.focus = Focus::None;
         }
+        if self.focus == Focus::Message {
+            self.message_keys(ui);
+        }
         if self.focus != Focus::None {
             return;
         }
         if ui.input.take_key(Key::Char('z'), true).is_some() {
             self.undo();
         }
-        if self.resolving.is_some() {
+        // The resolver has keys of its own; the workspace's menu may be open over everything.
+        if self.resolving.is_some() || ui.blocked {
             return;
         }
-        if ui.input.take_key(Key::Escape, false).is_some() {
-            if self.file_view.is_some() {
-                self.file_view = None;
-            } else if self.compare.is_some() {
-                self.act(Act::CompareClose);
-            } else if self.tab == Tab::Files {
-                self.tab = Tab::Changes;
-            } else if self.wide {
-                self.wide = false;
-            }
-        }
-        if ui.input.take_key(Key::Char('w'), false).is_some() {
-            self.act(Act::ToggleWide);
-        }
-        if ui.input.take_key(Key::Char('v'), false).is_some() {
-            self.act(Act::ToggleSplit);
-        }
-        // ⌥↑/⌥↓ reorders the selected commit (keyboard interactive rebase).
-        if let Some(i) = ui.input.keys.iter().position(|k| matches!(k.key, Key::Up | Key::Down) && k.mods.alt) {
-            let k = ui.input.keys.remove(i);
-            self.act(Act::MoveCommit(k.key == Key::Up));
-        }
-        let input = &mut ui.input;
-        let down = input.take_key(Key::Down, false).is_some() || input.take_key(Key::Char('j'), false).is_some();
-        let up = input.take_key(Key::Up, false).is_some() || input.take_key(Key::Char('k'), false).is_some();
-        let row = match self.sel {
-            Sel::Wip => Some(0),
-            Sel::Commit(_) => self.sel_row().map(|i| i + 1),
-        };
-        if let Some(row) = row {
-            let n = self.commits.len() + 1;
-            let target = if down { Some((row + 1).min(n - 1)) } else if up { Some(row.saturating_sub(1)) } else { None };
-            if let Some(t) = target.filter(|&t| t != row) {
-                self.select(if t == 0 { Sel::Wip } else { Sel::Commit(t - 1) });
-                self.reveal_row(t);
-            }
-        }
-        if ui.input.take_key(Key::Char('c'), false).is_some() {
-            self.select(Sel::Wip);
-            self.focus = Focus::Message;
-        }
-        if ui.input.take_key(Key::Char('s'), false).is_some() && self.sel == Sel::Wip {
-            self.act(Act::StageAll);
-        }
-        if ui.input.take_key(Key::Char('f'), false).is_some() && self.sel_row().is_some() {
-            if self.tab == Tab::Files {
-                self.tab = Tab::Changes;
-                self.file_view = None;
-            } else {
-                self.act(Act::BrowseFiles);
-            }
-        }
+        // Everything else is lazygit's keymap (keys.rs), for the focused pane.
+        self.keyboard(ui);
     }
 
     // ---- top bar / chrome -------------------------------------------------------------------
@@ -2208,6 +2362,10 @@ impl GitApp {
             + 12.0
             + sections.iter().filter(|s| !s.1.is_empty()).map(|s| 30.0 + s.1.len() as f32 * LIST_ROW_H + 8.0).sum::<f32>();
         let off = self.side_scroll.update(ui, r, content);
+        self.side_view_h = r.h;
+        self.side_rows.clear();
+        // The keyboard cursor's row gets a ring.
+        let kb_row = |app: &Self, key: &SideKey| app.kb && app.pane == Pane::Branches && app.side_cursor.as_ref() == Some(key);
         ui.p.push_clip(r);
         let x = r.x + 14.0;
         let mut y = r.y + 8.0 - off;
@@ -2234,6 +2392,10 @@ impl GitApp {
         if sel || hov {
             ui.p.rounded(row, 5.0, if sel { theme::SELECT } else { theme::HOVER });
         }
+        self.side_rows.push((SideKey::Wip, row.y - r.y + off));
+        if kb_row(self, &SideKey::Wip) {
+            ui.p.rounded_stroke(row, 5.0, 1.5, theme::ACCENT);
+        }
         ui.p.ring((x + 6.0, row.cy()), 4.0, 1.5, theme::YELLOW);
         ui.p.text(x + 18.0, row.cy(), UI, 12.5, "Working copy", theme::TEXT);
         if !self.changes.is_empty() {
@@ -2244,6 +2406,7 @@ impl GitApp {
             if ui.input.pressed {
                 self.select(Sel::Wip);
                 self.reveal_row(0);
+                self.side_cursor = Some(SideKey::Wip);
             }
         }
         y += LIST_ROW_H;
@@ -2254,6 +2417,11 @@ impl GitApp {
         for (w, busy) in &others {
             let row = Rect::new(r.x + 6.0, y, r.w - 12.0, LIST_ROW_H);
             y += LIST_ROW_H;
+            let key = SideKey::Worktree(w.path.clone());
+            if kb_row(self, &key) {
+                ui.p.rounded_stroke(row, 5.0, 1.5, theme::ACCENT);
+            }
+            self.side_rows.push((key, row.y - r.y + off));
             // Rows being added or removed are inert until git is done.
             let hov = ui.hovered(row) && busy.is_none();
             if hov {
@@ -2344,8 +2512,14 @@ impl GitApp {
                 let rf = &self.refs[ri];
                 let row = Rect::new(r.x + 6.0, y, r.w - 12.0, LIST_ROW_H);
                 y += LIST_ROW_H;
+                let key = SideKey::Ref(ref_full(rf));
+                let cursor_here = kb_row(self, &key);
+                self.side_rows.push((key, row.y - r.y + off));
                 if row.bottom() < r.y || row.y > r.bottom() {
                     continue;
+                }
+                if cursor_here {
+                    ui.p.rounded_stroke(row, 5.0, 1.5, theme::ACCENT);
                 }
                 let target_row = self.hash_index.get(&rf.target).copied();
                 let selected = sel_row.is_some() && sel_row == target_row;
@@ -2433,6 +2607,7 @@ impl GitApp {
             }
         }
         if let Some(p) = open_wt {
+            self.side_cursor = Some(SideKey::Worktree(p.clone()));
             self.act(Act::OpenWorktree(p.display().to_string()));
         }
         if let Some(p) = wt_menu {
@@ -2456,6 +2631,8 @@ impl GitApp {
         }
         if let Some((ri, double, compare)) = clicked {
             let rf = self.refs[ri].clone();
+            // The keyboard goes on from what was clicked.
+            self.side_cursor = Some(SideKey::Ref(ref_full(&rf)));
             if compare {
                 self.act(Act::CompareRef(rf.target.clone(), rf.name.clone()));
             } else if double && rf.kind == RefKind::Local && !rf.is_head {
@@ -2638,6 +2815,10 @@ impl GitApp {
             if let Some(l) = self.lineage.as_ref().filter(|l| i > 0 && l.merge_at(i - 1)) {
                 // A merge that took the selected branch into another one.
                 ui.p.rect(row, l.color.alpha(0.08));
+            }
+            if i > 0 && self.copied.contains(&self.commits[i - 1].hash) {
+                // Copied for cherry-picking (C), like lazygit's cyan.
+                ui.p.rect(row, theme::CYAN.alpha(0.14));
             }
             if selected {
                 ui.p.rect(row, theme::SELECT.alpha(0.75));
@@ -2887,7 +3068,7 @@ impl GitApp {
             } else if frac > 0.7 {
                 RebaseOp::Below
             } else {
-                RebaseOp::Squash
+                RebaseOp::Fixup
             };
             g.target = Some((row as usize, op));
         }
@@ -2913,7 +3094,7 @@ impl GitApp {
                     ui.p.ring((list.x + lanes_w, ly), 4.0, 2.0, theme::ACCENT);
                     label = "Move here".into();
                 }
-                RebaseOp::Squash => {
+                RebaseOp::Fixup | RebaseOp::Squash => {
                     ui.p.rounded(tr, 6.0, theme::PURPLE.alpha(0.12));
                     ui.p.rounded_stroke(tr, 6.0, 1.5, theme::PURPLE);
                     label = format!("Squash into “{}”", self.commits[t].subject.chars().take(40).collect::<String>());
@@ -2992,7 +3173,25 @@ impl GitApp {
 
     // ---- detail panel -----------------------------------------------------------------------
 
+    /// The right-hand panel. Records where its file list and its diff went (the Files and
+    /// Main panes for the keyboard).
     fn detail(&mut self, ui: &mut Ui, r: Rect) {
+        self.main_rect = None;
+        self.detail_body(ui, r);
+        let inner = Rect::new(r.x + 1.0, r.y, r.w - 1.0, r.h);
+        let main = self.main_rect.take();
+        let files = match main {
+            Some(m) if m.x > inner.x + 40.0 => Rect::new(inner.x, inner.y, m.x - inner.x, inner.h),
+            Some(m) => Rect::new(inner.x, inner.y, inner.w, (m.y - inner.y).max(0.0)),
+            None => inner,
+        };
+        self.pane_rects.push((Pane::Files, files));
+        if let Some(m) = main {
+            self.pane_rects.push((Pane::Main, m));
+        }
+    }
+
+    fn detail_body(&mut self, ui: &mut Ui, r: Rect) {
         ui.p.rect(r, theme::PANEL);
         ui.p.rect(Rect::new(r.x, r.y, 1.0, r.h), theme::BORDER);
         let inner = Rect::new(r.x + 1.0, r.y, r.w - 1.0, r.h);
@@ -3042,6 +3241,7 @@ impl GitApp {
         let files: Vec<&Change> = self.changes.iter().filter(|c| !c.conflicted() && if staged { c.staged() } else { c.unstaged() }).collect();
         let scroll = if staged { &mut self.staged_scroll } else { &mut self.unstaged_scroll };
         let off = scroll.update(ui, r, files.len() as f32 * LIST_ROW_H);
+        self.list_view_h[staged as usize] = r.h;
         let (mut click, mut toggle, mut discard) = (None, None, None);
         ui.p.push_clip(r);
         if files.is_empty() {
@@ -3266,7 +3466,7 @@ impl GitApp {
         if self.focus == Focus::Message {
             self.msg.handle(&mut ui.input, true);
         }
-        let placeholder = "Commit message  (c to focus, ⌘↵ to commit)";
+        let placeholder = "Commit message  (c to focus · enter commits · tab for a description)";
         if self.msg.draw(ui, editor, placeholder, self.focus == Focus::Message, true) {
             self.focus = Focus::Message;
         } else if ui.input.pressed && self.focus == Focus::Message && !ui.hovered(editor) {
@@ -3298,6 +3498,7 @@ impl GitApp {
         // The toolbar lines up with the column's header when they sit side by side.
         let mut diff_r = if columns { diff_area } else { area };
         let bar = diff_r.take_top(if columns { 44.0 } else { 34.0 });
+        self.main_rect = Some(Rect::new(diff_r.x, bar.y, diff_r.w, diff_r.bottom() - bar.y));
         self.diff_toolbar(ui, bar);
         let split = self.split_for(diff_r.w);
         if let Some(a) = self.diff.draw(ui, diff_r, split, self.authors) {
@@ -3607,6 +3808,7 @@ impl GitApp {
             c.files_scroll = scroll;
         }
         let diff_r = if narrow { area } else { Rect::new(area.x + 1.0, area.y, area.w - 1.0, area.h) };
+        self.main_rect = Some(diff_r);
         let action = self.diff.draw(ui, diff_r, split, self.authors);
         if let Some(DiffAction::OpenCommit(h)) = &action {
             let h = h.clone();
@@ -3757,7 +3959,9 @@ impl GitApp {
         let mut diff_r = diff_area.unwrap_or(area);
         let split = self.split_for(diff_r.w);
         let off = self.files_scroll.update(ui, list_r, nf as f32 * 22.0);
-        let current = self.diff.current_file(split);
+        self.list_view_h[0] = list_r.h;
+        // The keyboard's file when it's driving this list, else the one the diff is showing.
+        let current = if self.kb && self.pane == Pane::Files { Some(self.file_cursor) } else { self.diff.current_file(split) };
         let mut jump = None;
         ui.p.push_clip(list_r);
         for (fi, f) in self.diff.files.iter().enumerate() {
@@ -3795,12 +3999,14 @@ impl GitApp {
 
         // Same toolbar height as in the wide working copy, so the diff doesn't shift between them.
         let bar = diff_r.take_top(if diff_area.is_some() { 44.0 } else { 34.0 });
+        self.main_rect = Some(Rect::new(diff_r.x, bar.y, diff_r.w, diff_r.bottom() - bar.y));
         self.diff_toolbar(ui, bar);
         if let Some(a) = self.diff.draw(ui, diff_r, split, self.authors) {
             self.apply_diff_action(a);
         }
         if let Some(fi) = jump {
             self.diff.jump_to_file(fi, split);
+            self.file_cursor = fi;
         }
     }
 
@@ -3921,6 +4127,31 @@ impl GitApp {
         }
         if let Some(branch) = self.palette.upstream_for.clone() {
             self.palette.items = self.upstream_prompt_items(&branch, &q);
+            return;
+        }
+        if let Some(hash) = self.palette.reword_of.clone() {
+            let short = hash[..8.min(hash.len())].to_string();
+            self.palette.items = match q.is_empty() {
+                true => vec![],
+                false => vec![Item {
+                    label: format!("Reword {short} to “{q}”"),
+                    detail: "the description stays".into(),
+                    act: Act::Reword { hash, message: q },
+                    score: 0,
+                    kind: "commit",
+                }],
+            };
+            return;
+        }
+        if let Some(from) = self.palette.rename_of.clone() {
+            self.palette.items = if !valid_ref_name(&q) || q == from {
+                vec![]
+            } else if self.local_names.contains(&q) {
+                let act = Act::PromptRename(from);
+                vec![Item { label: format!("A branch named '{q}' already exists"), detail: "pick another name".into(), act, score: 0, kind: "branch" }]
+            } else {
+                vec![Item { label: format!("Rename {from} to {q}"), detail: "git branch -m".into(), act: Act::RenameBranch { from, to: q }, score: 0, kind: "branch" }]
+            };
             return;
         }
         let mut create: Option<Item> = None;
@@ -4291,6 +4522,8 @@ impl GitApp {
             None if self.palette.branch_at.is_some() => "New branch name…".into(),
             None if self.palette.tag_at.is_some() => "Tag name, then a message to make it an annotated tag…".into(),
             None if self.palette.upstream_for.is_some() => format!("Remote branch for {} to track…", self.palette.upstream_for.as_deref().unwrap_or("")),
+            None if self.palette.reword_of.is_some() => "New commit subject (the description stays)…".into(),
+            None if self.palette.rename_of.is_some() => "New branch name…".into(),
             None => "Type a command, branch, commit, or a path to open…".into(),
         };
         self.palette.input.draw(ui, input_r, &placeholder, true, false);
@@ -4459,7 +4692,7 @@ impl GitApp {
         } else {
             None
         };
-        self.menu = Some(Menu { at, title: format!("Push {branch} to…"), note, items, fresh: true });
+        self.menu = Some(Menu::new(at, format!("Push {branch} to…"), note, items));
     }
 
     /// Remotes with the current branch's upstream remote first, plus that upstream ("origin/main").
@@ -4496,7 +4729,7 @@ impl GitApp {
             it.detail = short_url(url);
             items.push(it);
         }
-        self.menu = Some(Menu { at, title: "Fetch from…".into(), note: None, items, fresh: true });
+        self.menu = Some(Menu::new(at, "Fetch from…".into(), None, items));
     }
 
     /// Remote picker for Pull: each remote that has this branch, with how far behind / ahead it
@@ -4559,7 +4792,7 @@ impl GitApp {
         } else {
             Some(("Fast-forward only · counts are as of the last fetch".to_string(), theme::DIM))
         };
-        self.menu = Some(Menu { at, title: format!("Pull into {branch} from…"), note, items, fresh: true });
+        self.menu = Some(Menu::new(at, format!("Pull into {branch} from…"), note, items));
     }
 
     /// Right-click on a worktree in the sidebar.
@@ -4598,7 +4831,7 @@ impl GitApp {
         }
         let color = if w.prunable || w.changes > 0 { theme::YELLOW } else { theme::DIM };
         let title = format!("{}{}", tilde(&w.path), if is_main { "  (main worktree)" } else { "" });
-        self.menu = Some(Menu { at, title, note: Some((note, color)), items, fresh: true });
+        self.menu = Some(Menu::new(at, title, Some((note, color)), items));
     }
 
     fn open_commit_menu(&mut self, row: usize, at: (f32, f32)) {
@@ -4635,7 +4868,7 @@ impl GitApp {
             danger(format!("Reset {head} here · discard changes (hard)"), Act::Reset(hash.clone(), "hard")),
         ]);
         let title = format!("{short} · {}", c.subject);
-        self.menu = Some(Menu { at, title, note, items, fresh: true });
+        self.menu = Some(Menu::new(at, title, note, items));
     }
 
     fn open_branch_menu(&mut self, name: &str, at: (f32, f32)) {
@@ -4710,7 +4943,7 @@ impl GitApp {
             items.push(sep());
             items.push(danger(format!("Delete branch {}", rf.name), Act::DeleteBranch(rf.name.clone())));
         }
-        self.menu = Some(Menu { at, title: rf.name.clone(), note, items, fresh: true });
+        self.menu = Some(Menu::new(at, rf.name.clone(), note, items));
     }
 
     /// "Merge src into dst", which always makes a merge commit, and when dst is behind src (a
@@ -4758,7 +4991,7 @@ impl GitApp {
         items.push(sep());
         items.push(item(format!("Compare {dst} ↔ {src}"), Act::CompareRef(s.target.clone(), s.name.clone())));
         let note = self.preview_note(&d.target, &s.target, src);
-        self.menu = Some(Menu { at, title: format!("{src}  →  {dst}"), note, items, fresh: true });
+        self.menu = Some(Menu::new(at, format!("{src}  →  {dst}"), note, items));
     }
 
     fn branch_drag(&mut self, ui: &mut Ui) {
@@ -4804,22 +5037,35 @@ impl GitApp {
             return;
         }
         let Some(m) = &self.menu else { return };
-        let row_h = 30.0;
+        let row_h = MENU_ROW_H;
+        // An item's own key, as a key cap (unless its detail already lists the keys).
+        let cap = |it: &MenuItem| it.keys.first().copied().filter(|_| it.detail != it.keys.join("  "));
+        let cap_w = |ui: &mut Ui, k: &str| ui.p.measure(MONO, 11.0, k) + 12.0;
         let mut w: f32 = ui.p.measure(UI, 11.5, &m.title).min(380.0) + 32.0;
         for it in &m.items {
             let dw = if it.detail.is_empty() { 0.0 } else { ui.p.measure(UI, 11.5, &it.detail) + 24.0 };
-            w = w.max(ui.p.measure(UI, 13.0, &it.label) + 40.0 + dw);
+            let kw = cap(it).map_or(0.0, |k| cap_w(ui, k) + 10.0);
+            w = w.max(ui.p.measure(UI, 13.0, &it.label) + 40.0 + dw + kw);
         }
         if let Some((n, _)) = &m.note {
             w = w.max((ui.p.measure(UI, 11.5, n) + 40.0).min(460.0));
         }
         let w = w.clamp(240.0, 560.0);
+        let head = 34.0 + if m.note.is_some() { 26.0 } else { 0.0 };
         let body: f32 = m.items.iter().map(|it| if it.act.is_some() { row_h } else { 9.0 }).sum();
-        let h = 34.0 + if m.note.is_some() { 26.0 } else { 0.0 } + body + 8.0;
         let s = ui.screen;
+        // Taller than the window: the items scroll (wheel, or following the highlight).
+        let h = (head + body + 8.0).min(s.h - 16.0);
+        let view = h - head - 8.0;
         let x = m.at.0.min(s.right() - w - 8.0).max(8.0);
         let y = m.at.1.min(s.bottom() - h - 8.0).max(8.0);
         let r = Rect::new(x, y, w, h);
+        let mut scroll = m.scroll;
+        if r.contains(ui.input.mouse) && ui.input.scroll.1 != 0.0 {
+            scroll -= ui.input.scroll.1;
+            ui.input.scroll.1 = 0.0;
+        }
+        let scroll = scroll.clamp(0.0, (body - view).max(0.0));
         let fresh = m.fresh;
         if !fresh && (ui.input.pressed || ui.input.right_pressed) && !r.contains(ui.input.mouse) {
             self.menu = None;
@@ -4829,14 +5075,16 @@ impl GitApp {
         ui.p.rounded(r, 10.0, theme::PANEL2);
         ui.p.rounded_stroke(r, 10.0, 1.0, theme::BORDER.mix(theme::TEXT, 0.1));
         ui.p.text_fit(r.x + 14.0, r.y + 18.0, r.w - 28.0, UI, 11.5, &m.title, theme::FAINT);
-        let mut cy = r.y + 34.0;
         if let Some((n, c)) = &m.note {
-            ui.p.circle((r.x + 18.0, cy + 9.0), 3.5, *c);
-            ui.p.text_fit(r.x + 28.0, cy + 9.0, r.w - 40.0, UI, 11.5, n, *c);
-            cy += 26.0;
+            let ny = r.y + 34.0 + 9.0;
+            ui.p.circle((r.x + 18.0, ny), 3.5, *c);
+            ui.p.text_fit(r.x + 28.0, ny, r.w - 40.0, UI, 11.5, n, *c);
         }
+        let body_r = Rect::new(r.x, r.y + head, r.w, view + 4.0);
+        ui.p.push_clip(body_r);
+        let mut cy = body_r.y - scroll;
         let mut chosen = None;
-        for it in &m.items {
+        for (idx, it) in m.items.iter().enumerate() {
             match &it.act {
                 None => {
                     ui.p.rect(Rect::new(r.x + 10.0, cy + 4.0, r.w - 20.0, 1.0), theme::BORDER);
@@ -4844,26 +5092,40 @@ impl GitApp {
                 }
                 Some(a) => {
                     let row = Rect::new(r.x + 5.0, cy, r.w - 10.0, row_h);
-                    let hov = row.contains(ui.input.mouse);
-                    if hov {
+                    let hov = row.contains(ui.input.mouse) && body_r.contains(ui.input.mouse);
+                    // Hovered, or highlighted from the keyboard (j / k, enter picks it).
+                    if hov || m.sel == Some(idx) {
                         ui.p.rounded(row, 6.0, if it.danger { theme::RED.alpha(0.18) } else { theme::SELECT });
+                    }
+                    if hov {
                         ui.cursor = Cursor::Pointer;
                         if ui.input.pressed {
                             chosen = Some(a.clone());
                         }
                     }
                     let fg = if it.danger { theme::RED } else { theme::TEXT };
+                    let mut right = row.right() - 10.0;
+                    if let Some(k) = cap(it) {
+                        let kw = cap_w(ui, k);
+                        let kr = Rect::new(right - kw, row.cy() - 9.0, kw, 18.0);
+                        ui.p.rounded_stroke(kr, 4.0, 1.0, theme::BORDER.mix(theme::TEXT, 0.2));
+                        ui.p.text(kr.x + 6.0, kr.cy(), MONO, 11.0, k, theme::DIM);
+                        right = kr.x - 10.0;
+                    }
                     let dw = if it.detail.is_empty() { 0.0 } else { ui.p.measure(UI, 11.5, &it.detail).min(row.w * 0.6) };
-                    ui.p.text_fit(row.x + 10.0, row.cy(), row.w - 30.0 - dw, UI, 13.0, &it.label, fg);
+                    ui.p.text_fit(row.x + 10.0, row.cy(), right - row.x - 20.0 - dw, UI, 13.0, &it.label, fg);
                     if dw > 0.0 {
-                        ui.p.text_fit(row.right() - 10.0 - dw, row.cy(), dw, UI, 11.5, &it.detail, theme::DIM);
+                        ui.p.text_fit(right - dw, row.cy(), dw, UI, 11.5, &it.detail, theme::DIM);
                     }
                     cy += row_h;
                 }
             }
         }
+        ui.p.pop_clip();
         if let Some(m) = &mut self.menu {
             m.fresh = false;
+            m.scroll = scroll;
+            m.view_h = view;
         }
         if let Some(a) = chosen {
             self.menu = None;
@@ -5356,6 +5618,13 @@ mod tests {
             }
             panic!("worktree job didn't finish");
         }
+        /// Presses keys written lazygit-style ("j", "J", "<space>", "<c-j>"), a frame each.
+        fn keys(&mut self, keys: &str) {
+            for k in keys.split_whitespace() {
+                self.ui.input.keys.push(keys::press(k));
+                self.frame();
+            }
+        }
         fn menu_labels(&self) -> Vec<String> {
             self.app.menu.as_ref().expect("menu open").items.iter().filter(|i| i.act.is_some()).map(|i| i.label.clone()).collect()
         }
@@ -5828,6 +6097,197 @@ mod tests {
         for d in [&dir, &up] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    #[test]
+    fn lazygit_keys_stage_files_lines_and_commit() {
+        let dir = temp_repo("kb-stage");
+        let git = |args: &[&str]| git::run(&dir, args, None).unwrap();
+        let body: Vec<String> = (1..=12).map(|i| format!("line {i}")).collect();
+        std::fs::write(dir.join("a"), body.join("\n") + "\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "a"]);
+        let mut edited = body.clone();
+        edited[1] = "line 2!".into();
+        edited[9] = "line 10!".into();
+        std::fs::write(dir.join("a"), edited.join("\n") + "\n").unwrap();
+        std::fs::write(dir.join("one"), "one, changed").unwrap();
+        std::fs::write(dir.join("two"), "two, changed").unwrap();
+        let mut h = Harness::new(&dir);
+        let index = |h: &Harness, p: &str| h.app.repo.as_ref().unwrap().git(&["show", &format!(":{p}")]).unwrap();
+        // Like lazygit: the files have focus when there are changes.
+        assert!(h.app.pane == Pane::Files);
+        assert_eq!(h.app.wip_file, Some(("a".to_string(), false)));
+        h.keys("j j k");
+        assert_eq!(h.app.wip_file, Some(("one".to_string(), false)));
+        // space stages it, and the next file slides under the cursor.
+        h.keys("<space>");
+        assert_eq!(index(&h, "one"), "one, changed");
+        assert_eq!(h.app.wip_file, Some(("two".to_string(), false)));
+
+        // enter: line by line in the diff of "a".
+        h.keys("k <enter>");
+        assert!(h.app.pane == Pane::Main);
+        let lines = |h: &Harness| {
+            let mut v: Vec<String> = h.app.diff.selected.iter().map(|&(f, hk, l)| h.app.diff.files[f].hunks[hk].lines[l].clone()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(lines(&h), ["-line 2"]);
+        h.keys("j");
+        assert_eq!(lines(&h), ["+line 2!"]);
+        h.keys("<space>");
+        // Just the added line went in; the cursor is on what's next.
+        assert!(index(&h, "a").contains("line 2\nline 2!\nline 3"), "{}", index(&h, "a"));
+        assert_eq!(lines(&h), ["-line 10"]);
+        // a: the whole hunk; v: a range.
+        h.keys("a");
+        assert_eq!(lines(&h), ["+line 10!", "-line 10"]);
+        h.keys("a k");
+        assert_eq!(lines(&h), ["-line 2"]);
+        h.keys("v j");
+        assert_eq!(lines(&h), ["-line 10", "-line 2"]);
+        // d discards the range from the file (undoable).
+        h.keys("d");
+        let file = std::fs::read_to_string(dir.join("a")).unwrap();
+        assert!(file.starts_with("line 1\nline 2\nline 2!\nline 3\n") && file.contains("line 9\nline 10\nline 10!\nline 11"), "{file}");
+        h.keys("z");
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), edited.join("\n") + "\n");
+        h.keys("<esc>");
+        assert!(h.app.pane == Pane::Files && h.app.diff.cursor.is_none());
+
+        // a stages everything; c and a summary (the 'c' isn't typed into it), tab to write a
+        // description, tab back, enter commits.
+        h.keys("a c");
+        assert!(h.app.focus == Focus::Message && h.app.msg.text.is_empty());
+        h.type_text("Keyboard commit");
+        h.keys("<tab>");
+        h.type_text("The details.");
+        h.keys("<enter>");
+        assert_eq!(h.app.msg.text, "Keyboard commit\n\nThe details.\n", "enter in the description is a new line");
+        h.ui.input.keys.push(keys::press("<backspace>"));
+        h.frame();
+        h.keys("<tab>");
+        assert_eq!(h.app.msg.cursor, "Keyboard commit".len());
+        h.keys("<enter>");
+        assert_eq!(git(&["log", "-1", "--format=%B"]).trim(), "Keyboard commit\n\nThe details.");
+        assert!(git(&["status", "--porcelain"]).trim().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lazygit_keys_in_the_commit_list() {
+        let dir = temp_repo("kb-commits");
+        let git = |args: &[&str]| git::run(&dir, args, None).unwrap();
+        for n in ["three", "four"] {
+            std::fs::write(dir.join(n), n).unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-qm", n]);
+        }
+        let mut h = Harness::new(&dir);
+        let subjects = || git(&["log", "--format=%s"]).lines().map(String::from).collect::<Vec<_>>();
+        assert!(h.app.pane == Pane::Commits, "no changes: the commits have focus");
+        assert_eq!(h.app.sel_row(), h.app.head_row);
+
+        // j / k move; `?` lists this pane's keys and esc closes it.
+        h.keys("j");
+        assert_eq!(h.app.selected.as_ref().unwrap().subject, "three");
+        h.keys("?");
+        let m = h.app.menu.as_ref().unwrap();
+        assert_eq!(m.title, "Keys · Commits");
+        assert!(m.items.iter().any(|i| i.label == "Squash into the commit below" && i.detail == "s"));
+        h.keys("<esc>");
+        assert!(h.app.menu.is_none());
+
+        // r rewords (an older commit too: the rebase keeps the rest).
+        h.keys("r");
+        assert_eq!(h.app.palette.input.text, "three");
+        h.app.palette.input.set("three, reworded");
+        h.frame();
+        h.keys("<enter>");
+        assert_eq!(subjects(), ["four", "three, reworded", "two", "one"]);
+        h.keys("z");
+        assert_eq!(subjects(), ["four", "three", "two", "one"]);
+
+        // g: the reset menu, with lazygit's s / m / h keys. (< is the top row: the working copy.)
+        h.keys("4 < j j j");
+        assert_eq!(h.app.selected.as_ref().unwrap().subject, "two");
+        h.keys("g");
+        assert_eq!(h.menu_labels(), ["Soft reset", "Mixed reset", "Hard reset"]);
+        h.keys("h");
+        assert_eq!(subjects(), ["two", "one"]);
+        h.keys("z");
+        assert_eq!(subjects(), ["four", "three", "two", "one"]);
+
+        // C copies, V pastes (cherry-picks) onto HEAD; s squashes keeping both messages.
+        git(&["switch", "-q", "-c", "side", "HEAD~2"]);
+        h.app.reload_all(false);
+        let row = |h: &Harness, s: &str| h.app.commits.iter().position(|c| c.subject == s).unwrap();
+        h.app.select(Sel::Commit(row(&h, "four")));
+        h.keys("C");
+        h.app.select(Sel::Commit(row(&h, "three")));
+        h.keys("C V");
+        assert_eq!(subjects(), ["four", "three", "two", "one"]);
+        assert!(h.app.copied.is_empty());
+        let head = h.app.head_row.unwrap();
+        h.app.select(Sel::Commit(head));
+        h.keys("s");
+        assert_eq!(subjects(), ["three", "two", "one"]);
+        assert_eq!(git(&["log", "-1", "--format=%B"]).trim(), "three\n\nfour");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lazygit_keys_in_the_branch_list() {
+        let dir = temp_repo("kb-branches");
+        let git = |args: &[&str]| git::run(&dir, args, None).unwrap();
+        git(&["switch", "-q", "-c", "feature"]);
+        std::fs::write(dir.join("f"), "f").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "feature work"]);
+        git(&["switch", "-q", "main"]);
+        let mut h = Harness::new(&dir);
+        let head = || git(&["symbolic-ref", "--short", "HEAD"]).trim().to_string();
+
+        // 3: the branch list, on the current branch. Moving shows the branch's commit.
+        h.keys("3");
+        assert!(h.app.pane == Pane::Branches);
+        assert_eq!(h.app.side_cursor, Some(SideKey::Ref("refs/heads/main".into())));
+        h.keys("k");
+        assert_eq!(h.app.side_cursor, Some(SideKey::Ref("refs/heads/feature".into())));
+        assert_eq!(h.app.selected.as_ref().unwrap().subject, "feature work");
+
+        // M: merge it (a merge commit first, the fast-forward offered too).
+        h.keys("M");
+        assert_eq!(h.menu_labels(), ["Merge feature into main", "Fast-forward main to feature"]);
+        h.keys("<enter>");
+        assert_eq!(git(&["log", "-1", "--format=%s"]).trim(), "Merge branch 'feature'");
+        h.keys("z");
+
+        // space checks out, - goes back; R renames, d deletes (undoable).
+        h.keys("<space>");
+        assert_eq!(head(), "feature");
+        h.keys("-");
+        assert_eq!(head(), "main");
+        h.app.side_cursor = Some(SideKey::Ref("refs/heads/feature".into()));
+        h.keys("R");
+        h.app.palette.input.set("topic");
+        h.frame();
+        h.keys("<enter>");
+        assert!(git(&["branch", "--list", "topic"]).contains("topic"));
+        h.app.side_cursor = Some(SideKey::Ref("refs/heads/topic".into()));
+        h.keys("d");
+        assert_eq!(h.menu_labels(), ["Delete branch topic"]);
+        h.keys("<enter>");
+        assert!(git(&["branch", "--list", "topic"]).trim().is_empty());
+        h.keys("z");
+        assert!(git(&["branch", "--list", "topic"]).contains("topic"));
+        // enter: to that branch's commits.
+        h.app.side_cursor = Some(SideKey::Ref("refs/heads/topic".into()));
+        h.keys("<enter>");
+        assert!(h.app.pane == Pane::Commits);
+        assert_eq!(h.app.selected.as_ref().unwrap().subject, "feature work");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

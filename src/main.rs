@@ -18,6 +18,7 @@ mod font;
 mod git;
 mod gpu;
 mod graph;
+mod keys;
 mod png;
 mod rebase;
 mod resolve;
@@ -110,6 +111,7 @@ fn map_key(k: &WKey) -> Option<Key> {
             NamedKey::PageUp => Key::PageUp,
             NamedKey::PageDown => Key::PageDown,
             NamedKey::Tab => Key::Tab,
+            NamedKey::Space => Key::Char(' '),
             _ => return None,
         },
         WKey::Character(s) => Key::Char(s.chars().next()?.to_ascii_lowercase()),
@@ -285,12 +287,14 @@ struct Args {
     resolve: Option<(String, String)>,
     /// "push" | "pull" | "fetch": open that button's remote picker.
     remote_menu: Option<&'static str>,
+    /// Keys to press before the screenshot, lazygit-style ("3 j <enter>").
+    keys: Option<String>,
     /// Stay attached to the terminal instead of moving to the background.
     foreground: bool,
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { repos: vec![], screenshot: None, size: (1440, 900), scale: 2.0, commit: None, palette: None, files: false, open: None, compare: None, split: None, wide: false, menu: None, resolve: None, remote_menu: None, foreground: false };
+    let mut a = Args { repos: vec![], screenshot: None, size: (1440, 900), scale: 2.0, commit: None, palette: None, files: false, open: None, compare: None, split: None, wide: false, menu: None, resolve: None, remote_menu: None, foreground: false, keys: None };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -327,13 +331,14 @@ fn parse_args() -> Args {
             }
             "--open" => a.open = it.next(),
             "--commit" => a.commit = it.next().and_then(|s| s.parse().ok()),
+            "--keys" => a.keys = it.next(),
             "-h" | "--help" => {
                 println!("usage: wgitpui [-f|--foreground] [REPO ...]");
                 println!();
                 println!("From a terminal, opens REPO (default: the current directory) in the running app,");
                 println!("or starts the app in the background so the shell stays usable. -f keeps it attached.");
                 println!();
-                println!("debug: wgitpui [--screenshot out.png [--size WxH] [--scale S] [--commit N] [--palette QUERY] [--files] [--open PATH] [--compare A,B] [--split|--unified] [--wide] [--menu BRANCH] [--resolve PATH[:o,t,b,-]] [--push-menu|--pull-menu|--fetch-menu]] [REPO]");
+                println!("debug: wgitpui [--screenshot out.png [--size WxH] [--scale S] [--commit N] [--palette QUERY] [--files] [--open PATH] [--compare A,B] [--split|--unified] [--wide] [--menu BRANCH] [--resolve PATH[:o,t,b,-]] [--push-menu|--pull-menu|--fetch-menu] [--keys \"3 j <enter>\"]] [REPO]");
                 std::process::exit(0);
             }
             _ => a.repos.push(PathBuf::from(arg)),
@@ -417,6 +422,12 @@ fn main() {
             if let Some(q) = &args.palette {
                 app.open_palette(q);
             }
+        }
+        for k in args.keys.iter().flat_map(|k| k.split_whitespace()) {
+            ui.input.keys.push(keys::press(k));
+            ui.begin(w as f32, h as f32, s);
+            ws.frame(&mut ui);
+            ui.input.end_frame();
         }
         // A few frames let smooth-scroll and layout settle exactly as they would on screen.
         // Background work (e.g. line attribution) is waited for, up to a few seconds.

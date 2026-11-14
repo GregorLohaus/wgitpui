@@ -17,6 +17,7 @@ Everything else is in-tree:
 - `git.rs`: drives the `git` CLI (porcelain formats), builds partial patches for line staging.
 - `graph.rs`: incremental lane layout for the commit graph, plus first-parent lines, which branch each commit belongs to, and where a line was merged into others.
 - `rebase.rs`: turns drag-and-drop gestures into `git rebase -i` todo lists.
+- `keys.rs`, `app/keyboard.rs`: the lazygit-style keymap (panes, key chords, the `?` menu) and what each key does.
 - `chrome.rs`: macOS title-bar integration via the Objective-C runtime.
 - `diffview.rs`, `fileview.rs`, `palette.rs`: the diff, blame/file/tree and palette views.
 - `syntax.rs`: per-line syntax highlighter and LCS word diff.
@@ -35,7 +36,7 @@ Everything else is in-tree:
 - **Undoable commits**: commit, amend and rebase record the previous HEAD; undo resets back to it.
 - **Drag-to-rebase**: drag a commit row in the graph. Drop on the top/bottom edge of another commit to reorder, or on its middle to squash (fixup) into it. It warns when the rewrite touches pushed history. `⌥↑`/`⌥↓` move the selected commit from the keyboard; *Squash into parent* and *Drop commit* are in the palette. Conflicts show a banner with Continue / Abort.
 - **Blame** with an age heatmap: newer lines glow orange, older ones fade to blue. Click a chunk to jump to its commit.
-- **Time machine** (*Files* tab, `f`): the repository tree at any commit with that commit's changes highlighted, plus a history scrubber. Drag it or press ▶ to replay history. An open file follows the scrubber, so you can watch a single file (and its blame) evolve.
+- **Time machine** (*Files* tab, `]`): the repository tree at any commit with that commit's changes highlighted, plus a history scrubber. Drag it or press ▶ to replay history. An open file follows the scrubber, so you can watch a single file (and its blame) evolve.
 - **Compare any two commits**: ⌘-click (or shift-click) a second commit in the graph, ⌘-click a branch in the sidebar, or use the palette (*Compare main ↔ feature*, *Compare with working tree*). The graph marks the endpoints A/B and highlights the commits in between. Toggle *exact diff* (`A B`) vs *since merge-base* (`A...B`, what a pull request shows), swap sides, see ahead/behind counts.
 - **Diff viewer** (used everywhere): unified or side-by-side, word-level change highlighting, syntax colors (Rust, C-family/JS/TS/Go/Java/Swift…, Python, shell, TOML/YAML/JSON), context lines 3 → 10 → 25 → whole file, ignore whitespace, collapsible files, a file index that tracks your scroll position, and a wide mode that hides the graph. In wide mode the working copy and commits become two columns: the file lists and commit message (or the commit's details and files) on the left, the diff on the right. A commit's *Files* tab does the same with its tree and the opened file. Drag the divider to resize the column; both views share its width.
 - **Who changed each line**: diffs, comparisons and the conflict resolver show author · age · short commit id per line (once per run of lines from the same commit, with an age-colored bar). Removed lines are attributed on the old side, added/context lines on the new side (commit vs. parent, working tree vs. index, B vs. A or the merge-base); uncommitted lines say so. Hover for the commit subject and exact date, click to jump to the commit. Loaded in the background, only for files on screen; *Authors* toggles it.
@@ -54,22 +55,40 @@ Everything else is in-tree:
 
 ## Keys
 
-| Key | Action |
+The keyboard works like [lazygit](https://github.com/jesseduffield/lazygit)'s defaults, mapped onto this
+layout: the sidebar is lazygit's status and branches panels, the graph its commits, the file list on the
+right its files, and the diff its staging view. While you use the keys, a ring shows the pane they go
+to; clicking a pane hands it the keys too. `?` lists every key of the focused pane (pick one to run it).
+
+| Key | Anywhere |
 |---|---|
-| `⌘K` / `⌘P` | command palette |
-| `↑↓` / `j k` | move through history |
-| `⌥↑` / `⌥↓` | move the selected commit up/down (rebase) |
-| `f` | toggle the Files / time-machine tab |
-| `⌘`/shift-click a commit | compare it with the selection |
-| right-click / ctrl-click | context menu (commit or branch) |
-| `v` | toggle split / unified diff |
-| `w` | toggle wide diff view |
-| `c` | focus commit message |
-| `⌘↵` | commit |
-| `⌘Z` | undo the last discard / commit / merge / rebase / reset / branch delete / tag / upstream change |
-| `s` | stage all (working copy) |
-| `Esc` | close file view / palette |
-| `⌘R` | refresh (also refreshes on window focus) |
+| `1` `2` `3` `4` | workspace (top of the sidebar) / files / branches / commits |
+| `h` `l` (`←` `→`), `tab` | pane to the left / right, or round |
+| `j` `k` (`↓` `↑`), `.` `,`, `>` `<` | next / previous, a page, last / first |
+| `enter` / `esc` | into a file's lines, a commit's files, a branch's commits / back out |
+| `]` `[` | sections of the branch list; a commit's Changes / Files (time machine) tabs |
+| `J` `K` (`pgdn` `pgup`, `ctrl-d` `ctrl-u`) | scroll the diff |
+| `P` / `p` | push / pull: straight to the upstream when it's a plain push or a fast-forward, else the remote picker |
+| `c` | write the commit message: `enter` commits the summary, `tab` adds a description, `⌘↵` commits from anywhere |
+| `z` (`⌘Z`) | undo the last discard / commit / merge / rebase / reset / branch delete / tag / upstream change |
+| `m` | continue or abort a merge / rebase in progress |
+| `/` (`⌘K`, `⌘P`) | command palette |
+| `ctrl-r` | recent repositories |
+| `+` / `_` | wide diff view on / off |
+| `}` / `{` | more / less diff context |
+| `ctrl-w` | ignore whitespace on / off |
+| `\|` | split / unified diff |
+| `R` (`⌘R`) | refresh (it also refreshes when the window gets focus) |
+
+| Pane | Keys |
+|---|---|
+| Files | `space` stage / unstage the file · `a` everything · `enter` stage lines · `d` discard… · `D` reset… · `A` amend the last commit · `e` `o` open · `y` copy… · `f` fetch |
+| Diff | `j` `k` line · `h` `l` hunk · `a` whole hunk · `v` range (or shift-`↓` `↑`) · `space` stage / unstage · `d` discard · `tab` unstaged ↔ staged · `esc` back to the files |
+| Commits | `space` check out · `enter` its files · `n` branch · `T` tag · `g` reset… · `t` revert · `C` / `V` copy / paste (cherry-pick) · `ctrl-j` `ctrl-k` (`⌥↓` `⌥↑`) move · `s` squash · `f` fixup · `d` drop · `r` reword · `A` amend · `y` copy… · `w` worktree |
+| Branches | `space` check out · `enter` its commits · `n` new · `d` delete… · `M` merge… · `r` rebase onto · `f` fast-forward · `u` upstream · `R` rename · `T` tag · `P` push the tag · `g` reset to… · `-` previous branch · `c` by name · `w` worktree · `y` copy |
+
+With the mouse: `⌘`/shift-click a commit to compare it with the selection; right-click (or ctrl-click) for a
+context menu. Not here (yet): stash, bisect and custom patches; `q` doesn't quit (it's a window: `⌘Q`).
 
 ## Install (macOS)
 

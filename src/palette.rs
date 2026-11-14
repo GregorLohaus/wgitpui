@@ -64,6 +64,28 @@ pub enum Act {
     /// Push one tag, or all of them (None), to a remote.
     PushTag { tag: Option<String>, remote: String },
     DeleteTag(String),
+    /// A keyboard command (from the `?` menu).
+    Key(crate::keys::Cmd),
+    /// Put text on the clipboard.
+    CopyText(String),
+    /// Ask for a commit's new message, then reword it.
+    PromptReword(String),
+    Reword { hash: String, message: String },
+    /// Ask for a branch's new name, then rename it.
+    PromptRename(String),
+    RenameBranch { from: String, to: String },
+    /// Fold the staged changes into HEAD, keeping its message.
+    Amend,
+    /// Cherry-pick these commits (oldest first) onto HEAD.
+    CherryPickMany(Vec<String>),
+    /// Squash the selected commit into its parent, keeping both messages.
+    SquashWithMessage,
+    /// Take a file's staged changes out of the index and the working tree.
+    DiscardStaged(String),
+    /// Discard a file's unstaged changes (or delete it, if untracked).
+    DiscardFile(String),
+    /// `git switch -`.
+    CheckoutPrev,
     ResolveUse(String, bool),
     MarkResolved(String),
     OpenResolver(String),
@@ -131,6 +153,10 @@ pub struct Palette {
     pub tag_at: Option<String>,
     /// When set, the palette is asking which remote branch this local branch should track.
     pub upstream_for: Option<String>,
+    /// When set, the palette is asking for this commit's new message.
+    pub reword_of: Option<String>,
+    /// When set, the palette is asking for this branch's new name.
+    pub rename_of: Option<String>,
     /// True on the frame the palette opened: the click that opened it must not close it.
     pub fresh: bool,
 }
@@ -144,6 +170,8 @@ impl Palette {
         self.worktree_from = None;
         self.tag_at = None;
         self.upstream_for = None;
+        self.reword_of = None;
+        self.rename_of = None;
         self.fresh = true;
     }
 }
