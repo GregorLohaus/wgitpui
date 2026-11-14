@@ -12,6 +12,7 @@ mod chrome;
 mod cli;
 mod diffview;
 mod fileview;
+mod filetree;
 mod palette;
 mod clipboard;
 mod config;
@@ -250,7 +251,7 @@ impl ApplicationHandler<UserEvent> for Shell {
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if let Some(key) = map_key(&event.logical_key) {
-                    input.keys.push(KeyPress { key, mods: input.mods });
+                    input.push_key(KeyPress { key, mods: input.mods });
                 }
                 if !input.mods.primary() && !input.mods.ctrl {
                     if let Some(t) = &event.text {
@@ -425,7 +426,7 @@ fn main() {
             }
         }
         for k in args.keys.iter().flat_map(|k| k.split_whitespace()) {
-            ui.input.keys.push(keys::press(k));
+            ui.input.push_key(keys::press(k));
             ui.begin(w as f32, h as f32, s);
             ws.frame(&mut ui);
             ui.input.end_frame();

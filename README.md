@@ -17,7 +17,8 @@ Everything else is in-tree:
 - `git.rs`: drives the `git` CLI (porcelain formats), builds partial patches for line staging.
 - `graph.rs`: incremental lane layout for the commit graph, plus first-parent lines, which branch each commit belongs to, and where a line was merged into others.
 - `rebase.rs`: turns drag-and-drop gestures into `git rebase -i` todo lists.
-- `keys.rs`, `app/keyboard.rs`: the lazygit-style keymap (panes, key chords, the `?` menu and the key bar) and what each key does.
+- `keys.rs`, `app/keyboard.rs`: the lazygit-style keymap (panes, key chords, the `?` menu and the key bar) and what each key does. A key can only be read through `Ui::key` with a `Binding` (its keys, its `?` text, its bar label, whether it applies right now), and the bar and `?` list are made from exactly the bindings offered that frame, so they can't show a key that does nothing or miss one that works.
+- `filetree.rs`: changed files as a folder tree with status letters and lines added / removed; the working copy's unstaged and staged lists, a commit's, a stash's and a comparison's files all use it.
 - `config.rs`: the settings file (`key = value` lines).
 - `chrome.rs`: macOS title-bar integration via the Objective-C runtime.
 - `diffview.rs`, `fileview.rs`, `palette.rs`: the diff, blame/file/tree and palette views.
@@ -32,6 +33,7 @@ Everything else is in-tree:
 - **Branch lineage**: the selected branch's history (its first-parent line, all the way down) is drawn in one color with a soft glow while the rest of the graph steps back. Selecting a branch, or a commit it points at, picks that branch; any other commit picks the line it sits on (main keeps its own line, a merged and deleted branch still forms one); the working copy picks HEAD's branch. Every merge that took the branch into another one gets a glowing ring.
 - **Streaming history**: `git log` is streamed on a background thread into an incremental lane layout, so the first screen paints immediately (100k commits fully load in under a second). Refreshes are skipped entirely when no ref or HEAD moved.
 - **Minimap scrollbar**: branch, tag, HEAD and selection markers across the whole history, plus the selected branch: a rail over its own commits and a glowing dot at every merge into another branch. Drag to scrub.
+- **File trees**: changed files are listed by folder, everywhere (unstaged, staged, a commit's, a stash's, a comparison's): folders first, a folder that only holds one folder shares its row (`src/app`), and every row shows its status and the lines it adds and removes (a folder: the sum). Click a folder to close or open it; hover a row for *Stage* / *Unstage* / *Discard*, which on a folder act on everything in it. Closed folders stay closed as the files change. A commit's diff follows the tree's order, so going down the list goes down the diff.
 - **Line-level staging**: click or drag across `+`/`-` lines, then *Stage N lines* / *Unstage N lines*. A selection can span hunks (any of their buttons acts on all of it) and survives refreshes. Hunk and file staging too.
 - **Stashes**: *Stash…* in the working copy's header (or `s` / `S` in its files) puts changes away: all of them, with untracked files, only what's staged, or all but the staged ones. The stashes stay out of the way until there are some: then *Stashes · N* (or `5`) lists them, and one opens in place of the working copy with its message, branch, files and diff, to apply, pop, branch from, rename or drop. Stashing and dropping are undoable.
 - **Discard with undo**: discard files, hunks or selected lines (or delete untracked files). In the staged diff, *Discard* takes staged hunks or lines out of both the index and the working tree. Every destructive action goes on an undo stack (`⌘Z`, or *Undo* in the toast), and a copy is written to `.git/wgitpui-trash/` so nothing is ever truly lost.
@@ -72,7 +74,7 @@ and so does `key_bar = false` in the settings file (below); ⌘K → *Show the k
 | `1` `2` `3` `4` | the panes left to right: sidebar / commits / files / diff |
 | `h` `l` (`←` `→`), `tab` | pane to the left / right, or round |
 | `j` `k` (`↓` `↑`), `.` `,`, `>` `<` | next / previous, a page, last / first |
-| `enter` / `esc` | into a file's lines, a commit's files, a branch's commits / back out |
+| `enter` / `esc` | into a file's diff, a commit's files, a branch's commits / back out |
 | `]` `[` | sections of the branch list; a commit's Changes / Files (time machine) tabs |
 | `J` `K` (`pgdn` `pgup`, `ctrl-d` `ctrl-u`) | scroll the diff |
 | `P` / `p` | push / pull: straight to the upstream when it's a plain push or a fast-forward, else the remote picker |
@@ -90,11 +92,11 @@ and so does `key_bar = false` in the settings file (below); ⌘K → *Show the k
 
 | Pane | Keys |
 |---|---|
-| Files | `space` stage / unstage the file · `a` everything · `enter` stage lines · `d` discard… · `D` reset… · `A` amend the last commit · `s` stash · `S` stash options… · `e` `o` open · `y` copy… · `f` fetch |
+| Files | `j` `k` files and folders · `h` close the folder, or up to the one it's in · `l` open the folder, or into it (where there's no folder to do that with, `h` `l` move between panes as everywhere) · `space` stage / unstage the file, or everything in the folder · `a` everything · `enter` into the diff (on a folder: close / open it; on a conflict: the resolver) · `d` discard… (a folder: all of it) · `D` reset… · `A` amend the last commit · `s` stash · `S` stash options… · `e` `o` open · `y` copy… · `f` fetch |
 | Diff | `j` `k` line · `h` `l` hunk · `space` select the line · `a` select the hunk · shift-`↓` `↑` select while moving · `s` stage / unstage the selection · `d` discard it (with nothing selected: the line under the cursor) · `tab` unstaged ↔ staged · `esc` clear the selection, then back to the files |
 | Commits | `space` check out · `enter` its files · `n` branch · `T` tag · `g` reset… · `t` revert · `C` / `V` copy / paste (cherry-pick) · `ctrl-j` `ctrl-k` (`⌥↓` `⌥↑`) move · `s` squash · `f` fixup · `d` drop · `r` reword · `A` amend · `y` copy… |
 | Branches | `space` check out · `enter` its commits · `n` new · `d` delete… · `M` merge… · `r` rebase onto · `f` fast-forward · `u` upstream · `R` rename · `T` tag · `P` push the tag · `g` reset to… · `-` previous branch · `c` by name · `y` copy |
-| Stash | `space` apply · `g` pop · `d` drop… · `n` branch from it · `r` rename · `enter` its diff · `esc` close |
+| Stash | `space` apply · `g` pop · `d` drop… · `n` branch from it · `r` rename · `enter` its diff · `h` `l` folders, as in Files · `esc` close |
 
 With the mouse: `⌘`/shift-click a commit to compare it with the selection; right-click (or ctrl-click) for a
 context menu. Not here (yet): bisect and custom patches; `q` doesn't quit (it's a window: `⌘Q`).

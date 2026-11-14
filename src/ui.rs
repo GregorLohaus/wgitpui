@@ -465,15 +465,22 @@ pub struct Input {
     /// True when the scroll came from a precise device (trackpad) and should not be smoothed.
     pub scroll_precise: bool,
     pub text: String,
-    pub keys: Vec<KeyPress>,
+    /// This frame's key presses. Private: only a key binding offered with `Ui::key` (which lists
+    /// itself in the key bar and the `?` list) or a text field gets to read them.
+    keys: Vec<KeyPress>,
     pub mods: Mods,
 }
 
 impl Input {
-    /// Removes and returns the first key press matching `key` with the primary modifier state `primary`.
-    pub fn take_key(&mut self, key: Key, primary: bool) -> Option<KeyPress> {
-        let i = self.keys.iter().position(|k| k.key == key && k.mods.primary() == primary)?;
-        Some(self.keys.remove(i))
+    /// A key press from the window (or a test, or the key bar clicking an entry).
+    pub fn push_key(&mut self, k: KeyPress) {
+        self.keys.push(k);
+    }
+
+    /// Whether any key press is still unclaimed.
+    #[cfg(test)]
+    pub fn keys_left(&self) -> usize {
+        self.keys.len()
     }
 
     pub fn end_frame(&mut self) {
@@ -497,9 +504,64 @@ pub enum Cursor {
     Grabbing,
 }
 
+/// A key binding, offered with `Ui::key`. Keys are written the way lazygit writes them: "j",
+/// "J", "<c-j>", "<space>", and "<m-k>" for the platform's command key (⌘K, or ctrl-k).
+#[derive(Clone, Copy, Debug)]
+pub struct Binding {
+    pub keys: &'static [&'static str],
+    /// What it does, for the `?` list ("" leaves it out).
+    pub help: &'static str,
+    /// A word or two for the key bar ("" leaves it off).
+    pub bar: &'static str,
+    /// Whether it does anything right now: one that doesn't is neither run nor listed.
+    pub on: bool,
+}
+
+pub const fn bind(keys: &'static [&'static str], help: &'static str) -> Binding {
+    Binding { keys, help, bar: "", on: true }
+}
+
+impl Binding {
+    pub const fn bar(mut self, label: &'static str) -> Binding {
+        self.bar = label;
+        self
+    }
+
+    pub const fn when(mut self, on: bool) -> Binding {
+        self.on = on;
+        self
+    }
+}
+
+/// The key bindings on offer: this frame's so far, in order (the first one offered gets a
+/// key), and all of the previous frame's.
+#[derive(Default)]
+pub struct Keymap {
+    pub now: Vec<Binding>,
+    pub last: Vec<Binding>,
+    /// A menu, the palette or a text field has the keys: later offers don't count.
+    closed: bool,
+}
+
+/// Of `offered`, the bindings a key press would actually reach: `on`, and with at least one
+/// key no earlier binding takes. What the key bar and the `?` list show.
+pub fn reachable(offered: &[Binding]) -> Vec<Binding> {
+    let mut taken: Vec<crate::keys::Chord> = Vec::new();
+    let mut out = Vec::new();
+    for b in offered.iter().filter(|b| b.on) {
+        let chords: Vec<crate::keys::Chord> = b.keys.iter().map(|k| crate::keys::Chord::parse(k)).collect();
+        if chords.iter().any(|c| !taken.contains(c)) {
+            out.push(*b);
+        }
+        taken.extend(chords);
+    }
+    out
+}
+
 pub struct Ui {
     pub p: Painter,
     pub input: Input,
+    pub keymap: Keymap,
     pub screen: Rect,
     /// When set, the background is covered by a modal and must not react to the mouse.
     pub blocked: bool,
@@ -518,6 +580,7 @@ impl Ui {
         Ui {
             p: Painter::new(fonts),
             input: Input::default(),
+            keymap: Keymap::default(),
             screen: Rect::default(),
             blocked: false,
             animating: false,
@@ -542,6 +605,61 @@ impl Ui {
         self.blocked = false;
         self.drag_window = false;
         self.toggle_maximize = false;
+        self.keymap.last = std::mem::take(&mut self.keymap.now);
+        self.keymap.closed = false;
+    }
+
+    /// Offers a key binding for this frame and returns how often one of its keys was pressed.
+    /// Offering lists it (in the key bar and the `?` list, when it's `on` and has a label
+    /// there), and it's the only way to read a key, text fields aside: so what's listed is
+    /// exactly what works, and nothing works that isn't listed.
+    pub fn presses(&mut self, b: Binding) -> usize {
+        if self.keymap.closed {
+            return 0;
+        }
+        self.keymap.now.push(b);
+        if !b.on {
+            return 0;
+        }
+        let chords: Vec<crate::keys::Chord> = b.keys.iter().map(|k| crate::keys::Chord::parse(k)).collect();
+        let before = self.input.keys.len();
+        self.input.keys.retain(|k| !chords.iter().any(|c| c.matches(k)));
+        let n = before - self.input.keys.len();
+        if n > 0 {
+            // The key's character mustn't also land in a text field it opens.
+            self.input.text.clear();
+        }
+        n
+    }
+
+    pub fn key(&mut self, b: Binding) -> bool {
+        self.presses(b) > 0
+    }
+
+    /// Like `key`, telling which of the binding's keys was pressed (⌘1 … ⌘9 as one binding).
+    pub fn key_index(&mut self, b: Binding) -> Option<usize> {
+        if self.keymap.closed {
+            return None;
+        }
+        self.keymap.now.push(b);
+        if !b.on {
+            return None;
+        }
+        let chords: Vec<crate::keys::Chord> = b.keys.iter().map(|k| crate::keys::Chord::parse(k)).collect();
+        let (i, j) = self.input.keys.iter().enumerate().find_map(|(i, k)| Some((i, chords.iter().position(|c| c.matches(k))?)))?;
+        self.input.keys.remove(i);
+        self.input.text.clear();
+        Some(j)
+    }
+
+    /// From here on this frame, offers don't count: a menu, the palette or a text field has the
+    /// keys. With `swallow` the keys nobody took are dropped too (no text field wants them).
+    pub fn close_keys(&mut self, swallow: bool) {
+        self.keymap.closed = true;
+        if swallow {
+            self.input.keys.clear();
+            self.input.text.clear();
+        }
     }
 
     pub fn wake_in(&mut self, d: Duration) {
@@ -905,5 +1023,32 @@ impl TextEdit {
         }
         ui.p.pop_clip();
         hov && ui.input.pressed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_go_to_the_first_binding_offered_and_only_offered_ones_list() {
+        let mut ui = Ui::new(crate::font::Fonts::load().unwrap());
+        ui.begin(800.0, 600.0, 1.0);
+        ui.input.push_key(crate::keys::press("j"));
+        ui.input.push_key(crate::keys::press("x"));
+        // Off: neither takes the key nor reaches the list.
+        assert!(!ui.key(bind(&["j"], "off").bar("off").when(false)));
+        assert!(ui.key(bind(&["j", "<down>"], "down").bar("down")));
+        assert!(!ui.key(bind(&["j"], "shadowed").bar("shadowed")), "the earlier binding took it");
+        let labels: Vec<&str> = reachable(&ui.keymap.now).iter().map(|b| b.bar).collect();
+        assert_eq!(labels, ["down"], "off and shadowed bindings don't show");
+        // Once something modal has the keys, later offers neither count nor show.
+        ui.close_keys(false);
+        assert!(!ui.key(bind(&["x"], "late").bar("late")));
+        assert_eq!(ui.keymap.now.len(), 3);
+        assert_eq!(ui.input.keys_left(), 1, "x is left for a text field");
+        // A new frame starts over, keeping the last one's list for `?`.
+        ui.begin(800.0, 600.0, 1.0);
+        assert!(ui.keymap.now.is_empty() && ui.keymap.last.len() == 3);
     }
 }

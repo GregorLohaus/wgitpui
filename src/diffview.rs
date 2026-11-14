@@ -153,7 +153,10 @@ impl DiffView {
         Self::new(vec![], DiffMode::Commit, String::new())
     }
 
-    pub fn new(files: Vec<FileDiff>, mode: DiffMode, key: String) -> Self {
+    pub fn new(mut files: Vec<FileDiff>, mode: DiffMode, key: String) -> Self {
+        // In the order the file list (a folder tree) shows them, so going down the list goes
+        // down the diff.
+        files.sort_by(|a, b| crate::filetree::tree_order(&a.path, &b.path));
         let status = files
             .iter()
             .map(|f| {

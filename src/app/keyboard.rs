@@ -2,53 +2,63 @@
 //! (`keys.rs`) does there, keyboard-driven menus, and the ring that shows the focused pane.
 
 use super::*;
-use crate::ui::KeyPress;
+use crate::ui::{bind, Binding};
 
 /// Panes left to right, as laid out (wide mode hides the first two).
 const ORDER: [Pane; 5] = [Pane::Branches, Pane::Commits, Pane::Files, Pane::Stash, Pane::Main];
 
 impl GitApp {
-    /// Keys for the focused pane, or for an open menu. A key that runs a command is used up.
-    pub(super) fn keyboard(&mut self, ui: &mut Ui) {
-        if self.menu.is_some() {
-            self.menu_keys(ui);
+    /// The focused pane's keys (keys.rs), offered in order: the pane's own, then the global
+    /// ones it doesn't take over. What `applies` says doesn't work right now isn't offered.
+    /// After a key runs, what's on offer is worked out again (another pane, a menu…), so the
+    /// key bar always shows what the next key will do.
+    pub(super) fn pane_keys(&mut self, ui: &mut Ui) {
+        let mark = ui.keymap.now.len();
+        'offer: loop {
+            ui.keymap.now.truncate(mark);
+            self.sync_changes_tree();
+            for b in keys::offers(self.pane) {
+                if !ui.key(bind(b.keys, b.help).bar(b.bar).when(self.applies(b.cmd))) {
+                    continue;
+                }
+                self.kb = true;
+                match b.cmd {
+                    Cmd::Help => self.help_menu(&ui.keymap.last),
+                    cmd => self.run_cmd(cmd),
+                }
+                // A menu, the palette or the commit message took over: theirs are the keys now.
+                if self.menu.is_some() || self.focus != Focus::None {
+                    ui.keymap.now.truncate(mark);
+                    match (self.menu.is_some(), self.focus) {
+                        (true, _) => self.menu_keys(ui),
+                        (_, Focus::Palette) => self.palette_keys(ui),
+                        _ => self.message_keys(ui),
+                    }
+                    return;
+                }
+                continue 'offer;
+            }
             return;
         }
-        let mut keys = std::mem::take(&mut ui.input.keys).into_iter();
-        let mut rest = Vec::new();
-        for k in keys.by_ref() {
-            let Some(cmd) = keys::lookup(self.pane, &k) else {
-                rest.push(k);
-                continue;
-            };
-            self.kb = true;
-            // The key's character mustn't also land in a text field it opens (`c`, `/`).
-            ui.input.text.clear();
-            self.run_cmd(cmd);
-            // A prompt, menu or text field took over: the remaining keys are theirs.
-            if self.focus != Focus::None || self.menu.is_some() {
-                break;
-            }
-        }
-        rest.extend(keys);
-        ui.input.keys = rest;
     }
 
     /// lazygit's commit message box: enter on the summary line commits, tab goes to the
-    /// description and back. Shift / ⌥-enter still make a new line anywhere.
+    /// description and back. Everything else is the text field's (shift / ⌥-enter: a new line).
     pub(super) fn message_keys(&mut self, ui: &mut Ui) {
         let on_summary = !self.msg.text[..self.msg.cursor.min(self.msg.text.len())].contains('\n');
-        let plain = |k: &KeyPress| !k.mods.shift && !k.mods.alt && !k.mods.ctrl && !k.mods.logo;
-        let keys = &mut ui.input.keys;
-        if on_summary {
-            if let Some(i) = keys.iter().position(|k| k.key == Key::Enter && plain(k)) {
-                keys.remove(i);
-                self.commit();
-                return;
-            }
-        }
-        if let Some(i) = keys.iter().position(|k| k.key == Key::Tab && plain(k)) {
-            keys.remove(i);
+        let enter = ui.key(bind(&["<enter>"], "Commit").bar("commit").when(on_summary));
+        let command_enter = ui.key(bind(&["<m-enter>"], "Commit").bar("commit"));
+        let tab = match on_summary {
+            true => ui.key(bind(&["<tab>"], "Write a description").bar("description")),
+            false => ui.key(bind(&["<tab>"], "Back to the summary").bar("summary")),
+        };
+        let leave = ui.key(bind(&["<esc>"], "Leave the message (it stays)").bar("leave"));
+        ui.close_keys(false);
+        if leave {
+            self.focus = Focus::None;
+        } else if enter || command_enter {
+            self.commit();
+        } else if tab {
             let t = &mut self.msg;
             if on_summary {
                 if !t.text.contains('\n') {
@@ -64,40 +74,56 @@ impl GitApp {
         }
     }
 
-    /// j / k (↓ / ↑), tab, enter, esc and a menu's own keys (`s` / `m` / `h` in the reset menu,
-    /// any listed key in the `?` menu). Other keys do nothing while a menu is open.
-    fn menu_keys(&mut self, ui: &mut Ui) {
-        let keys = std::mem::take(&mut ui.input.keys);
-        ui.input.text.clear();
-        for k in keys {
-            let Some(m) = &mut self.menu else { return };
-            let is = |s: &str| keys::Chord::parse(s).matches(&k);
-            let live: Vec<usize> = (0..m.items.len()).filter(|&i| m.items[i].act.is_some()).collect();
-            if live.is_empty() || is("<esc>") {
-                self.menu = None;
-                return;
-            }
+    /// The palette's keys; typing goes to its text field.
+    pub(super) fn palette_keys(&mut self, ui: &mut Ui) {
+        let down = ui.presses(bind(&["<down>"], "Next").bar("move"));
+        let up = ui.presses(bind(&["<up>"], "Previous").bar("move"));
+        let run = ui.key(bind(&["<enter>"], "Run it").bar("run"));
+        let close = ui.key(bind(&["<esc>"], "Close").bar("close"));
+        ui.close_keys(false);
+        if close {
+            self.focus = Focus::None;
+            return;
+        }
+        let n = self.palette.items.len();
+        self.palette.sel = (self.palette.sel + down).saturating_sub(up).min(n.saturating_sub(1));
+        if let Some(item) = self.palette.items.get(self.palette.sel).filter(|_| run) {
+            let a = item.act.clone();
+            self.focus = Focus::None;
+            self.act(a);
+        }
+    }
+
+    /// A menu's keys: moving, picking, closing, and an item's own key (`s` / `m` / `h` in the
+    /// reset menu, every key in the `?` list). Nothing else gets a key while a menu is open.
+    pub(super) fn menu_keys(&mut self, ui: &mut Ui) {
+        let next = ui.presses(bind(&["j", "<down>", "<tab>"], "Next item").bar("move"));
+        let prev = ui.presses(bind(&["k", "<up>", "<s-tab>"], "Previous item").bar("move"));
+        let pick = ui.key(bind(&["<enter>"], "Pick it").bar("pick"));
+        let close = ui.key(bind(&["<esc>"], "Close").bar("close"));
+        let own: Vec<(usize, &'static [&'static str])> = self.menu.iter().flat_map(|m| m.items.iter().enumerate().filter(|(_, it)| it.act.is_some() && !it.keys.is_empty()).map(|(i, it)| (i, it.keys))).collect();
+        let hot = own.into_iter().find(|&(_, keys)| ui.key(bind(keys, ""))).map(|(i, _)| i);
+        ui.close_keys(true);
+        let Some(m) = &mut self.menu else { return };
+        let live: Vec<usize> = (0..m.items.len()).filter(|&i| m.items[i].act.is_some()).collect();
+        if close || live.is_empty() {
+            self.menu = None;
+            return;
+        }
+        for _ in 0..next {
             let at = m.sel.and_then(|s| live.iter().position(|&i| i == s));
-            let pick = if is("j") || is("<down>") || is("<tab>") {
-                m.sel = Some(live[at.map_or(0, |p| (p + 1) % live.len())]);
-                m.reveal_sel();
-                None
-            } else if is("k") || is("<up>") || is("<s-tab>") {
-                m.sel = Some(live[at.map_or(live.len() - 1, |p| (p + live.len() - 1) % live.len())]);
-                m.reveal_sel();
-                None
-            } else if is("<enter>") {
-                m.sel
-            } else {
-                m.items.iter().position(|it| it.act.is_some() && it.keys.iter().any(|s| is(s)))
-            };
-            if let Some(i) = pick {
-                let a = m.items[i].act.clone();
-                self.menu = None;
-                if let Some(a) = a {
-                    self.act(a);
-                }
-                return;
+            m.sel = Some(live[at.map_or(0, |p| (p + 1) % live.len())]);
+        }
+        for _ in 0..prev {
+            let at = m.sel.and_then(|s| live.iter().position(|&i| i == s));
+            m.sel = Some(live[at.map_or(live.len() - 1, |p| (p + live.len() - 1) % live.len())]);
+        }
+        m.reveal_sel();
+        if let Some(i) = hot.or(m.sel.filter(|_| pick)) {
+            let a = m.items[i].act.clone();
+            self.menu = None;
+            if let Some(a) = a {
+                self.act(a);
             }
         }
     }
@@ -150,67 +176,75 @@ impl GitApp {
 
     // ---- the key bar ------------------------------------------------------------------------
 
-    /// What the key bar shows: (keys, what they do, what a click runs), and whether `?` has
-    /// more. The focused pane's keys that do something right now; while a menu, the palette,
-    /// the commit message or the resolver has the keys, theirs.
-    pub(super) fn key_bar_entries(&self) -> (Vec<(String, String, Option<Cmd>)>, bool) {
-        let info = |v: &[(&str, &str)]| v.iter().map(|(k, w)| (k.to_string(), w.to_string(), None)).collect::<Vec<_>>();
-        if self.focus == Focus::Palette {
-            return (info(&[("↑ ↓", "move"), ("enter", "run"), ("esc", "close")]), false);
+    /// What the key bar shows, straight from the bindings offered this frame (so it's what
+    /// works right now, wherever the keys are: a pane, a menu, the palette, the commit message,
+    /// the resolver): (keys, label, the key a click presses). Neighbours with one label share an
+    /// entry ("h l  hunks"). And whether `?` (every key) is on offer.
+    pub(super) fn key_bar_entries(offered: &[Binding]) -> (Vec<(String, &'static str, Option<&'static str>)>, bool) {
+        let reachable = crate::ui::reachable(offered);
+        let mut out: Vec<(Vec<&'static str>, &'static str)> = Vec::new();
+        for b in reachable.iter().filter(|b| !b.bar.is_empty()) {
+            match out.last_mut() {
+                Some(last) if last.1 == b.bar => last.0.push(b.keys[0]),
+                _ => out.push((vec![b.keys[0]], b.bar)),
+            }
         }
-        if self.menu.is_some() {
-            return (info(&[("j k", "move"), ("enter", "pick"), ("esc", "close")]), false);
-        }
-        if self.focus == Focus::Message {
-            let on_summary = !self.msg.text[..self.msg.cursor.min(self.msg.text.len())].contains('\n');
-            return match on_summary {
-                true => (info(&[("enter", "commit"), ("tab", "description"), ("⌘enter", "commit"), ("esc", "leave")]), false),
-                false => (info(&[("enter", "new line"), ("tab", "summary"), ("⌘enter", "commit"), ("esc", "leave")]), false),
-            };
-        }
-        if self.resolving.is_some() {
-            let keys = [("1", "yours"), ("2", "incoming"), ("3", "both"), ("0", "neither"), ("e", "edit"), ("n p", "next / previous"), ("v", "preview")];
-            return (info(&[&keys[..], &[("⌘S", "save"), ("esc", "back")]].concat()), false);
-        }
-        let entries = keys::bar(self.pane)
-            .into_iter()
-            .filter(|e| self.applies(e.cmd))
-            .map(|e| (e.keys, e.label.to_string(), e.single.then_some(e.cmd)))
-            .collect();
-        (entries, true)
+        let help = reachable.iter().any(|b| b.keys.contains(&"?"));
+        let entries = out.into_iter().map(|(keys, label)| (keys::show_keys(&keys), label, (keys.len() == 1).then(|| keys[0]))).collect();
+        (entries, help)
     }
 
-    /// Whether a key does something right now (cheap: drawn every frame).
+    /// Whether a pane's key does something right now: it's only offered (and so only listed
+    /// and only run) when it does. Cheap, as it's asked every frame.
     fn applies(&self, cmd: Cmd) -> bool {
         let wip = self.showing_wip();
+        let commit = self.sel_row().is_some();
         match (self.pane, cmd) {
-            (Pane::Files, Cmd::ToggleStaged | Cmd::ToggleAll | Cmd::DiscardMenu | Cmd::Stash) => wip && !self.changes.is_empty(),
-            (Pane::Files, Cmd::Amend) => wip && self.changes.iter().any(Change::staged),
-            (Pane::Files, Cmd::Enter) => !self.diff.files.is_empty(),
-            (Pane::Main, Cmd::SelectLine | Cmd::SelectHunk | Cmd::Stage | Cmd::Discard) => self.diff.selectable(),
+            // The file lists: what the row under the cursor is (a folder, a conflict, a file).
+            (Pane::Files | Pane::Stash, Cmd::ToggleFolder | Cmd::FolderRight) => self.tree_at().is_some_and(|(_, p)| p.ends_with('/')),
+            (Pane::Files | Pane::Stash, Cmd::FolderLeft) => self.folder_left().is_some(),
+            (Pane::Files, Cmd::Resolve) => self.tree_at().is_some_and(|(id, _)| id == TreeId::Conflicts),
+            (Pane::Files | Pane::Stash, Cmd::Enter) => self.tree_at().is_some_and(|(id, p)| !p.ends_with('/') && id != TreeId::Conflicts),
+            (Pane::Files, Cmd::ToggleStaged) => wip && self.tree_at().is_some(),
+            // Discarding a folder is for the unstaged list's.
+            (Pane::Files, Cmd::DiscardMenu) => wip && self.tree_at().is_some_and(|(id, p)| !(p.ends_with('/') && id == TreeId::Staged)),
+            (Pane::Files, Cmd::ToggleAll | Cmd::Stash | Cmd::StashMenu) => wip && !self.changes.is_empty(),
+            (Pane::Files, Cmd::Amend | Cmd::ResetMenu) => wip && !self.changes.is_empty(),
+            (Pane::Files, Cmd::OpenFile | Cmd::CopyMenu | Cmd::CopyPath) => self.cursor_file().is_some(),
+            (Pane::Main, Cmd::SelectLine | Cmd::SelectHunk | Cmd::Stage | Cmd::Discard | Cmd::RangeDown | Cmd::RangeUp) => self.diff.selectable(),
             (Pane::Main, Cmd::SwitchSide) => wip && self.diff.mode != DiffMode::Untracked,
-            (Pane::Commits, Cmd::PasteCommits) => !self.copied.is_empty(),
+            (Pane::Commits, Cmd::PasteCommits | Cmd::ClearCopied) => !self.copied.is_empty(),
             (Pane::Commits, Cmd::Enter) => true,
-            (Pane::Commits, _) if matches!(cmd, Cmd::Checkout | Cmd::NewBranch | Cmd::NewTag | Cmd::ResetMenu | Cmd::Revert | Cmd::CopyCommit) => {
-                self.sel_row().is_some()
-            }
-            (Pane::Commits, Cmd::MoveDown | Cmd::Squash | Cmd::Fixup | Cmd::Drop | Cmd::Reword) => self.sel_row().is_some(),
-            (Pane::Branches, Cmd::CheckoutPrev) => true,
-            (Pane::Branches, _) if keys::BINDINGS.iter().any(|b| b.pane == Some(Pane::Branches) && b.cmd == cmd) => self.cursor_ref().is_some(),
+            (Pane::Commits, Cmd::Checkout) => commit && self.sel_row() != self.head_row,
+            (Pane::Commits, Cmd::NewBranch | Cmd::NewTag | Cmd::ResetMenu | Cmd::Revert | Cmd::CopyCommit | Cmd::CopyMenu | Cmd::Amend) => commit,
+            (Pane::Commits, Cmd::MoveDown | Cmd::MoveUp | Cmd::Squash | Cmd::Fixup | Cmd::Drop | Cmd::Reword) => commit,
+            // The sidebar: the working copy and worktree rows take enter / space (and d, a
+            // worktree); everything else wants a branch, remote branch or tag.
+            (Pane::Branches, Cmd::CheckoutPrev | Cmd::CheckoutByName) => true,
+            (Pane::Branches, Cmd::Enter) => self.side_cursor.is_some(),
+            (Pane::Branches, Cmd::Checkout) => match &self.side_cursor {
+                Some(SideKey::Worktree(_)) => true,
+                Some(SideKey::Ref(_)) => self.cursor_ref().is_some_and(|r| !r.is_head),
+                _ => false,
+            },
+            (Pane::Branches, Cmd::Delete) => matches!(self.side_cursor, Some(SideKey::Worktree(_))) || self.cursor_ref().is_some_and(|r| !r.is_head),
+            (Pane::Branches, Cmd::Merge | Cmd::Rebase) => self.cursor_ref().is_some_and(|r| !r.is_head),
+            (Pane::Branches, Cmd::FastForward | Cmd::Upstream | Cmd::Rename) => self.cursor_ref().is_some_and(|r| r.kind == RefKind::Local),
+            (Pane::Branches, Cmd::NewBranch | Cmd::NewTag | Cmd::ResetMenu | Cmd::CopyMenu) => self.cursor_ref().is_some(),
             (_, Cmd::StashList) => !self.stashes.is_empty(),
             (_, Cmd::OpMenu) => self.op.is_some(),
-            (_, Cmd::Commit) => self.changes.iter().any(Change::staged),
             _ => true,
         }
     }
 
-    /// The keys for what has focus, along the bottom. An entry with one key can be clicked;
-    /// `?` lists them all; × hides the bar (a setting).
+    /// The keys for what has focus, along the bottom: exactly the bindings on offer this
+    /// frame. Clicking an entry with one key presses it; `?` lists them all; × hides the bar
+    /// (a setting).
     pub(super) fn draw_key_bar(&mut self, ui: &mut Ui, r: Rect) {
         ui.p.rect(r, theme::PANEL2);
         ui.p.rect(Rect::new(r.x, r.y, r.w, 1.0), theme::BORDER);
-        let (entries, more) = self.key_bar_entries();
-        let mut run = None;
+        let (entries, more) = Self::key_bar_entries(&ui.keymap.now);
+        let mut press = None;
         let cap = |ui: &mut Ui, x: f32, keys: &str| {
             let kw = ui.p.measure(MONO, 11.0, keys) + 10.0;
             let kr = Rect::new(x, r.cy() - 8.5, kw, 17.0);
@@ -218,7 +252,6 @@ impl GitApp {
             ui.p.text(kr.x + 5.0, kr.cy(), MONO, 11.0, keys, theme::TEXT.mix(theme::DIM, 0.35));
             kw
         };
-        // Right: hide, and everything (where the keymap is what's listening).
         let hide = Rect::new(r.right() - 28.0, r.y + 4.0, 22.0, r.h - 8.0);
         let hide_hov = ui.hovered(hide);
         if hide_hov {
@@ -236,7 +269,7 @@ impl GitApp {
                 ui.p.rounded(ar, 4.0, theme::HOVER);
                 ui.cursor = Cursor::Pointer;
                 if ui.input.pressed {
-                    run = Some(Cmd::Help);
+                    press = Some("?");
                 }
             }
             let kw = cap(ui, ar.x + 4.0, "?");
@@ -244,17 +277,17 @@ impl GitApp {
             limit = ar.x - 10.0;
         }
         let mut x = r.x + 12.0;
-        for (keys, what, cmd) in &entries {
+        for (keys, what, key) in &entries {
             let w = ui.p.measure(MONO, 11.0, keys) + 10.0 + 6.0 + ui.p.measure(UI, 11.5, what);
             if x + w > limit {
                 break;
             }
             let er = Rect::new(x - 4.0, r.y + 3.0, w + 8.0, r.h - 6.0);
-            if cmd.is_some() && ui.hovered(er) {
+            if key.is_some() && ui.hovered(er) {
                 ui.p.rounded(er, 4.0, theme::HOVER);
                 ui.cursor = Cursor::Pointer;
                 if ui.input.pressed {
-                    run = *cmd;
+                    press = *key;
                 }
             }
             let kw = cap(ui, x, keys);
@@ -266,8 +299,9 @@ impl GitApp {
             self.toast_ok("Key bar hidden — ⌘K “Show the key bar” brings it back (or key_bar in the config file)");
             return;
         }
-        if let Some(c) = run {
-            self.run_cmd(c);
+        // A click is that key, pressed next frame: whatever offers it then runs.
+        if let Some(k) = press {
+            self.act(Act::Press(k));
         }
     }
 
@@ -314,7 +348,8 @@ impl GitApp {
             Cmd::Refresh => self.act(Act::Refresh),
             Cmd::Undo => self.undo(),
             Cmd::Redo => self.toast_err("No redo here — z undoes"),
-            Cmd::Help => self.help_menu(),
+            // Needs the keys on offer: pane_keys opens it.
+            Cmd::Help => {}
             Cmd::Search => {
                 self.focus = Focus::Palette;
                 self.palette.reset("");
@@ -340,6 +375,44 @@ impl GitApp {
                 self.focus = Focus::Message;
             }
             // Files.
+            Cmd::ToggleFolder => {
+                if let Some((id, p)) = self.tree_at() {
+                    if let Some(t) = self.tree_mut(id) {
+                        let open = !t.is_open(&p);
+                        t.set_open(&p, open);
+                    }
+                    self.tree_go((id, p));
+                }
+            }
+            Cmd::FolderLeft => {
+                if let Some((id, p, close)) = self.folder_left() {
+                    if close {
+                        if let Some(t) = self.tree_mut(id) {
+                            t.set_open(&p, false);
+                        }
+                    }
+                    self.tree_go((id, p));
+                }
+            }
+            Cmd::FolderRight => {
+                let Some((id, p)) = self.tree_at().filter(|(_, p)| p.ends_with('/')) else { return };
+                let Some(t) = self.tree_mut(id) else { return };
+                if t.is_open(&p) {
+                    // Into it: its first row.
+                    let first = t.row_of(&p).and_then(|r| t.rows().get(r + 1)).map(|r| r.path.clone());
+                    if let Some(c) = first {
+                        self.tree_go((id, c));
+                    }
+                } else {
+                    t.set_open(&p, true);
+                    self.tree_go((id, p));
+                }
+            }
+            Cmd::Resolve => {
+                if let Some((TreeId::Conflicts, p)) = self.tree_at() {
+                    self.act(Act::OpenResolver(p));
+                }
+            }
             Cmd::ToggleStaged => self.toggle_staged(),
             Cmd::ToggleAll => {
                 let unstaged = self.changes.iter().any(|c| c.unstaged() && !c.conflicted());
@@ -500,16 +573,17 @@ impl GitApp {
                     self.pane = Pane::Files;
                     return;
                 }
-                if !self.showing_wip() && self.diff.cursor.is_none() {
-                    self.diff.cursor_in_file(self.file_cursor);
-                } else {
-                    self.diff.cursor_start();
+                match self.tree_file_index().filter(|_| !self.showing_wip() && self.diff.cursor.is_none()) {
+                    Some(fi) => self.diff.cursor_in_file(fi),
+                    None => self.diff.cursor_start(),
                 }
             }
+            // A commit's files: the cursor starts where the diff is.
             Pane::Files | Pane::Stash if !self.showing_wip() => {
-                let n = self.diff.files.len();
-                self.file_cursor = self.diff.current_file(self.diff.split()).unwrap_or(0).min(n.saturating_sub(1));
+                self.sync_changes_tree();
+                self.tree_cursor = self.diff_row();
             }
+            Pane::Files => self.tree_cursor = self.tree_at(),
             Pane::Branches if self.side_cursor.is_none() => {
                 let head = self.refs.iter().find(|r| r.is_head && r.kind == RefKind::Local).map(|r| SideKey::Ref(ref_full(r)));
                 self.side_cursor = head.or(Some(SideKey::Wip));
@@ -565,16 +639,11 @@ impl GitApp {
                 None => {}
             },
             Pane::Commits => self.set_pane(Pane::Files),
-            Pane::Stash => self.set_pane(Pane::Main),
-            Pane::Files => {
-                let conflicted = self.wip_file.as_ref().filter(|_| self.showing_wip()).filter(|(p, _)| self.changes.iter().any(|c| &c.path == p && c.conflicted()));
-                match conflicted {
-                    Some((p, _)) => {
-                        let p = p.clone();
-                        self.act(Act::OpenResolver(p));
-                    }
-                    None => self.set_pane(Pane::Main),
+            Pane::Files | Pane::Stash => {
+                if let Some(row) = self.tree_at() {
+                    self.tree_go(row);
                 }
+                self.set_pane(Pane::Main);
             }
             Pane::Main => {}
         }
@@ -860,13 +929,20 @@ impl GitApp {
         self.kb_menu(format!("{} in progress", op.name()), None, items);
     }
 
-    /// `?`: what the keys do in this pane; picking one (or pressing its key) runs it.
-    fn help_menu(&mut self) {
-        let items = keys::help(self.pane)
+    /// `?`: every key on offer (the last frame's complete list); picking one, or pressing its
+    /// key, presses it.
+    fn help_menu(&mut self, offered: &[Binding]) {
+        let mut seen: Vec<&str> = Vec::new();
+        let items = crate::ui::reachable(offered)
             .into_iter()
-            .map(|(k, help, cmd)| {
-                let mut it = item(help, Act::Key(cmd));
-                it.keys = k;
+            .filter(|b| !b.help.is_empty() && !b.keys.contains(&"?"))
+            .filter(|b| !seen.contains(&b.help) && {
+                seen.push(b.help);
+                true
+            })
+            .map(|b| {
+                let mut it = item(b.help, Act::Press(b.keys[0]));
+                it.keys = b.keys;
                 it
             })
             .collect();
@@ -1054,87 +1130,180 @@ impl GitApp {
 
     // ---- files ------------------------------------------------------------------------------
 
-    /// The working copy's files in list order: conflicts, unstaged, staged.
-    fn wip_items(&self) -> Vec<(String, bool)> {
-        let of = |f: &dyn Fn(&Change) -> bool, staged: bool| self.changes.iter().filter(|c| f(c)).map(|c| (c.path.clone(), staged)).collect::<Vec<_>>();
-        let mut v = of(&|c| c.conflicted(), false);
-        v.extend(of(&|c| c.unstaged() && !c.conflicted(), false));
-        v.extend(of(&|c| c.staged() && !c.conflicted(), true));
+    /// The rows the keyboard walks, top to bottom: the working copy's conflicts, then its
+    /// unstaged and staged trees; or the commit's (stash's, comparison's) changes.
+    fn tree_rows(&self) -> Vec<(TreeId, String)> {
+        if !self.showing_wip() {
+            return self.changes_tree.rows().iter().map(|r| (TreeId::Changes, r.path.clone())).collect();
+        }
+        let mut v: Vec<(TreeId, String)> = self.changes.iter().filter(|c| c.conflicted()).map(|c| (TreeId::Conflicts, c.path.clone())).collect();
+        v.extend(self.unstaged_tree.rows().iter().map(|r| (TreeId::Unstaged, r.path.clone())));
+        v.extend(self.staged_tree.rows().iter().map(|r| (TreeId::Staged, r.path.clone())));
         v
     }
 
-    /// The file the focused pane points at.
-    fn cursor_file(&self) -> Option<String> {
-        if self.showing_wip() {
-            return self.wip_file.as_ref().map(|(p, _)| p.clone());
+    pub(super) fn tree(&self, id: TreeId) -> Option<&FileTree> {
+        match id {
+            TreeId::Unstaged => Some(&self.unstaged_tree),
+            TreeId::Staged => Some(&self.staged_tree),
+            TreeId::Changes => Some(&self.changes_tree),
+            TreeId::Conflicts => None,
         }
-        let f = if self.pane == Pane::Main { self.diff.cursor.map(|c| c.0) } else { Some(self.file_cursor) };
-        self.diff.files.get(f?).map(|f| f.path.clone())
     }
 
-    fn file_step(&mut self, d: i64) {
+    fn tree_mut(&mut self, id: TreeId) -> Option<&mut FileTree> {
+        match id {
+            TreeId::Unstaged => Some(&mut self.unstaged_tree),
+            TreeId::Staged => Some(&mut self.staged_tree),
+            TreeId::Changes => Some(&mut self.changes_tree),
+            TreeId::Conflicts => None,
+        }
+    }
+
+    /// `path`'s row in that list, as the list stands (a file in a closed folder: the folder's).
+    fn row_in(&self, id: TreeId, path: &str) -> Option<(TreeId, String)> {
+        let wip = self.showing_wip();
+        match (id, self.tree(id)) {
+            (TreeId::Conflicts, _) => (wip && self.changes.iter().any(|c| c.conflicted() && c.path == path)).then(|| (id, path.to_string())),
+            (TreeId::Changes, _) if wip => None,
+            (TreeId::Unstaged | TreeId::Staged, _) if !wip => None,
+            (_, Some(t)) => t.row_near(path).map(|r| (id, t.rows()[r].path.clone())),
+            (_, None) => None,
+        }
+    }
+
+    /// The changes tree's row for the file the diff is at.
+    fn diff_row(&self) -> Option<(TreeId, String)> {
+        let f = self.diff.current_file(self.diff.split()).or((!self.diff.files.is_empty()).then_some(0))?;
+        self.row_in(TreeId::Changes, &self.diff.files.get(f)?.path)
+    }
+
+    /// The keyboard's row in the file lists: where it was put, while that row is there; or
+    /// the row of the file on screen.
+    pub(super) fn tree_at(&self) -> Option<(TreeId, String)> {
+        if let Some(at) = self.tree_cursor.as_ref().and_then(|(id, p)| self.row_in(*id, p)) {
+            return Some(at);
+        }
         if !self.showing_wip() {
-            let n = self.diff.files.len();
-            if n == 0 {
-                return;
+            return self.diff_row();
+        }
+        let (p, staged) = self.wip_file.as_ref()?;
+        let conflict = self.changes.iter().any(|c| &c.path == p && c.conflicted());
+        self.row_in(if conflict { TreeId::Conflicts } else if *staged { TreeId::Staged } else { TreeId::Unstaged }, p)
+    }
+
+    /// Where h goes: (list, row, whether it closes that folder) — the open folder under the
+    /// cursor, or the folder the row is in.
+    fn folder_left(&self) -> Option<(TreeId, String, bool)> {
+        let (id, p) = self.tree_at()?;
+        let t = self.tree(id)?;
+        if p.ends_with('/') && t.is_open(&p) {
+            return Some((id, p, true));
+        }
+        let up = t.parent(t.row_of(&p)?)?;
+        Some((id, t.rows()[up].path.clone(), false))
+    }
+
+    /// The file the tree's cursor is on, or a folder's first, as an index into the diff.
+    fn tree_file_index(&self) -> Option<usize> {
+        let (_, p) = self.tree_at()?;
+        self.diff.files.iter().position(|f| if p.ends_with('/') { f.path.starts_with(&p) } else { f.path == p })
+    }
+
+    /// Puts the keyboard on a row and shows it: a working-copy file's diff, or the commit's
+    /// diff scrolled to the file (a folder: its first).
+    fn tree_go(&mut self, (id, path): (TreeId, String)) {
+        self.tree_cursor = Some((id, path.clone()));
+        if let Some(t) = self.tree_mut(id) {
+            if let Some(r) = t.row_of(&path) {
+                t.scroll_to(r);
             }
-            self.file_cursor = (self.file_cursor as i64 + d).clamp(0, n as i64 - 1) as usize;
-            let split = self.diff.split();
-            self.diff.jump_to_file(self.file_cursor, split);
-            let y = self.file_cursor as f32 * 22.0;
-            let h = self.list_view_h[0];
-            self.files_scroll.reveal(y, y + 22.0, h);
-            return;
         }
-        let items = self.wip_items();
-        if items.is_empty() {
-            return;
-        }
-        let at = self.wip_file.as_ref().and_then(|w| items.iter().position(|i| i == w));
-        let i = at.map_or(0, |i| (i as i64 + d).clamp(0, items.len() as i64 - 1) as usize);
-        self.show_file(items[i].clone());
-    }
-
-    /// Shows a working-copy file's diff and keeps its row in view.
-    fn show_file(&mut self, f: (String, bool)) {
-        let (path, staged) = f.clone();
-        if self.wip_file.as_ref() != Some(&f) {
-            self.wip_file = Some(f);
-            self.diff.selected.clear();
-            self.load_wip_diff();
-        }
-        let list: Vec<&Change> = self.changes.iter().filter(|c| !c.conflicted() && if staged { c.staged() } else { c.unstaged() }).collect();
-        if let Some(i) = list.iter().position(|c| c.path == path) {
-            let (y, h) = (i as f32 * LIST_ROW_H, self.list_view_h[staged as usize]);
-            let scroll = if staged { &mut self.staged_scroll } else { &mut self.unstaged_scroll };
-            scroll.reveal(y, y + LIST_ROW_H, h);
+        match id {
+            TreeId::Changes => {
+                if let Some(fi) = self.tree_file_index() {
+                    let split = self.diff.split();
+                    self.diff.jump_to_file(fi, split);
+                }
+            }
+            _ if path.ends_with('/') => {}
+            _ => self.show_wip_file(path, id == TreeId::Staged),
         }
     }
 
-    /// space: stage the file if it's unstaged, unstage it if it's staged. The cursor stays at
-    /// the same place in the list, so the next file slides under it.
+    /// The file the focused pane points at (in the lists, a folder's path).
+    fn cursor_file(&self) -> Option<String> {
+        if self.pane == Pane::Main {
+            return match self.showing_wip() {
+                true => self.wip_file.as_ref().map(|(p, _)| p.clone()),
+                false => self.diff.cursor.and_then(|c| self.diff.files.get(c.0)).map(|f| f.path.clone()),
+            };
+        }
+        self.tree_at().map(|(_, p)| p.trim_end_matches('/').to_string())
+    }
+
+    /// j / k in the lists, folders included.
+    fn file_step(&mut self, d: i64) {
+        self.sync_changes_tree();
+        let rows = self.tree_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let n = rows.len() as i64;
+        let at = self.tree_at().and_then(|c| rows.iter().position(|r| *r == c));
+        let i = match at {
+            Some(i) => (i as i64 + d).clamp(0, n - 1),
+            None => (d - 1).clamp(0, n - 1),
+        };
+        self.tree_go(rows[i as usize].clone());
+    }
+
+    /// space: stage the file (a folder: everything in it) if it's unstaged, unstage it if it's
+    /// staged. The cursor stays at the same place in its list, so the next row slides under it.
     fn toggle_staged(&mut self) {
         if !self.showing_wip() {
             return;
         }
-        let Some((path, staged)) = self.wip_file.clone() else { return };
-        if self.changes.iter().any(|c| c.path == path && c.conflicted()) {
+        let Some((id, path)) = self.tree_at() else { return };
+        let Some(t) = self.tree(id) else {
             self.toast_err("Resolve the conflict first — enter opens the resolver");
             return;
-        }
-        let at = self.wip_items().iter().position(|i| *i == (path.clone(), staged)).unwrap_or(0);
-        let Some(repo) = &self.repo else { return };
-        let r = if staged { repo.unstage(&[&path]) } else { repo.stage(&[&path]) };
-        self.result(r, "");
-        self.reload_status();
-        let items = self.wip_items();
-        if let Some(f) = items.get(at.min(items.len().saturating_sub(1))) {
-            self.show_file(f.clone());
+        };
+        let files = t.files_under(&path);
+        let before = self.tree_rows();
+        let at = before.iter().position(|r| r.0 == id && r.1 == path).unwrap_or(0);
+        let in_list = before[..at].iter().filter(|r| r.0 == id).count();
+        self.stage_paths(&files, id != TreeId::Staged);
+        let after = self.tree_rows();
+        let same: Vec<&(TreeId, String)> = after.iter().filter(|r| r.0 == id).collect();
+        let next = match same.is_empty() {
+            false => Some(same[in_list.min(same.len() - 1)]),
+            true => after.get(at.min(after.len().saturating_sub(1))),
+        };
+        match next.cloned() {
+            Some(row) => self.tree_go(row),
+            None => self.tree_cursor = None,
         }
     }
 
     fn discard_menu(&mut self) {
-        let Some(path) = self.cursor_file().filter(|_| self.showing_wip()) else { return };
+        let Some((id, path)) = self.tree_at().filter(|_| self.showing_wip()) else { return };
+        if path.ends_with('/') {
+            if id != TreeId::Unstaged {
+                return;
+            }
+            let files = self.unstaged_tree.files_under(&path);
+            let untracked = files.iter().filter(|f| self.changes.iter().any(|c| &c.path == *f && c.untracked())).count();
+            let n = files.len();
+            let mut it = danger(format!("Discard changes to {n} file{}", if n == 1 { "" } else { "s" }), Act::DiscardFiles(files));
+            it.detail = match untracked {
+                0 => "undoable".into(),
+                u => format!("deletes {u} untracked · undoable"),
+            };
+            it.keys = &["u"];
+            self.kb_menu(format!("Discard · {path}"), None, vec![it]);
+            return;
+        }
         let c = self.changes.iter().find(|c| c.path == path).cloned();
         let Some(c) = c else { return };
         let mut items = Vec::new();
@@ -1201,7 +1370,8 @@ impl GitApp {
             return;
         }
         self.diff.cursor_clear();
-        self.show_file((path, !staged));
+        let id = if staged { TreeId::Unstaged } else { TreeId::Staged };
+        self.tree_go((id, path));
         self.diff.cursor_start();
     }
 }

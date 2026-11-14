@@ -3,6 +3,7 @@
 use crate::chrome;
 use crate::diffview::{BlameSrc, DiffAction, DiffMode, DiffView};
 use crate::fileview::{FileAction, FileView, TreeAction, TreeView};
+use crate::filetree::{self, Click, Entry, FileTree, Look};
 use crate::font::{MONO, UI};
 use crate::git::{self, Change, Commit, DiffOpts, LogMsg, MergePreview, OpKind, Ref, RefKind, Repo, Side, Stash, StashKind, Worktree};
 use crate::graph::Graph;
@@ -12,7 +13,7 @@ mod keyboard;
 use crate::palette::{fuzzy, Act, Item, Palette, WtFrom};
 use crate::rebase::{self, ChainItem, RebaseOp};
 use crate::resolve::{ConflictDoc, ResolveAction};
-use crate::ui::{theme, Color, Cursor, Key, Rect, Scroll, TextEdit, Ui};
+use crate::ui::{bind, theme, Color, Cursor, Rect, Scroll, TextEdit, Ui};
 use crate::workspace::tilde;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -81,7 +82,6 @@ struct Compare {
     ahead: usize,
     behind: usize,
     range: HashSet<usize>,
-    files_scroll: Scroll,
 }
 
 struct MenuItem {
@@ -129,6 +129,16 @@ impl Menu {
             self.scroll = y0 + MENU_ROW_H - self.view_h;
         }
     }
+}
+
+/// Which file list a row is in, for the keyboard's cursor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TreeId {
+    Conflicts,
+    Unstaged,
+    Staged,
+    /// A commit's, stash's or comparison's changes.
+    Changes,
 }
 
 /// A row of the sidebar, for its keyboard cursor.
@@ -329,9 +339,6 @@ pub struct GitApp {
     graph_scroll: Scroll,
     graph_view_h: f32,
     side_scroll: Scroll,
-    unstaged_scroll: Scroll,
-    staged_scroll: Scroll,
-    files_scroll: Scroll,
     right_w: Option<f32>,
     /// Width of the left column in wide layouts (working copy and commit; None = automatic).
     col_w: Option<f32>,
@@ -365,10 +372,16 @@ pub struct GitApp {
     side_cursor: Option<SideKey>,
     side_rows: Vec<(SideKey, f32)>,
     side_view_h: f32,
-    /// Keyboard cursor in a commit's file list.
-    file_cursor: usize,
-    /// Visible heights of the unstaged and staged lists at the last frame.
-    list_view_h: [f32; 2],
+    /// The file lists, one tree component for all: the working copy's unstaged and staged
+    /// files, and the changes of the commit, stash or comparison on screen.
+    unstaged_tree: FileTree,
+    staged_tree: FileTree,
+    changes_tree: FileTree,
+    /// What the changes tree was made from (the diff's key, files and lines).
+    changes_sig: String,
+    /// The keyboard's row in the file lists: which list, and the row's path (a folder's ends
+    /// in '/').
+    tree_cursor: Option<(TreeId, String)>,
     /// Commits copied for cherry-picking (C), pasted by V.
     copied: Vec<String>,
     /// Where the diff (with its toolbar) was drawn this frame.
@@ -377,6 +390,8 @@ pub struct GitApp {
     /// selection.
     stashes: Vec<Stash>,
     stash_view: Option<String>,
+    /// Keys to press at the start of the next frame (key bar and `?` clicks).
+    pending_keys: Vec<&'static str>,
 }
 
 impl GitApp {
@@ -432,9 +447,6 @@ impl GitApp {
             graph_scroll: Scroll::default(),
             graph_view_h: 600.0,
             side_scroll: Scroll::default(),
-            unstaged_scroll: Scroll::default(),
-            staged_scroll: Scroll::default(),
-            files_scroll: Scroll::default(),
             right_w: None,
             col_w: None,
             drag: Drag::None,
@@ -455,12 +467,16 @@ impl GitApp {
             side_cursor: None,
             side_rows: vec![],
             side_view_h: 400.0,
-            file_cursor: 0,
-            list_view_h: [LIST_ROW_H * 7.0; 2],
+            unstaged_tree: FileTree::default(),
+            staged_tree: FileTree::default(),
+            changes_tree: FileTree::default(),
+            changes_sig: String::new(),
+            tree_cursor: None,
             copied: vec![],
             main_rect: None,
             stashes: vec![],
             stash_view: None,
+            pending_keys: vec![],
         };
         let path = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         app.open(path);
@@ -974,20 +990,172 @@ impl GitApp {
             Ok(c) => self.changes = c,
             Err(e) => self.toast_err(e),
         }
+        self.load_wip_trees();
         let valid = self.wip_file.as_ref().is_some_and(|(p, staged)| {
             self.changes.iter().any(|c| &c.path == p && if *staged { c.staged() } else { c.unstaged() })
         });
         if !valid {
-            self.wip_file = self
-                .changes
-                .iter()
-                .find(|c| c.unstaged())
-                .map(|c| (c.path.clone(), false))
-                .or_else(|| self.changes.iter().find(|c| c.staged()).map(|c| (c.path.clone(), true)));
+            // The top of the lists: a conflict, else the first unstaged file, else staged.
+            let conflict = self.changes.iter().find(|c| c.conflicted()).map(|c| (c.path.clone(), false));
+            let unstaged = self.unstaged_tree.first_file().map(|p| (p.to_string(), false));
+            let staged = self.staged_tree.first_file().map(|p| (p.to_string(), true));
+            self.wip_file = conflict.or(unstaged).or(staged);
         }
         if self.showing_wip() {
             self.load_wip_diff();
         }
+    }
+
+    /// The working copy's two file trees, with the lines each file adds and removes.
+    fn load_wip_trees(&mut self) {
+        let Some(repo) = &self.repo else { return };
+        let (unstaged, staged) = (repo.numstat(false), repo.numstat(true));
+        let mut budget = 64_000_000;
+        let mut entries = |staged_side: bool| -> Vec<Entry> {
+            self.changes
+                .iter()
+                .filter(|c| !c.conflicted() && if staged_side { c.staged() } else { c.unstaged() })
+                .map(|c| {
+                    let stats = if staged_side { staged.get(&c.path) } else { unstaged.get(&c.path) };
+                    let (adds, dels) = match stats {
+                        Some(&s) => s,
+                        None if c.untracked() => (git::line_count(&repo.root.join(&c.path), &mut budget), 0),
+                        None => (0, 0),
+                    };
+                    let from = c.orig.clone().filter(|_| staged_side);
+                    Entry { path: c.path.clone(), from, badge: status_badge(if staged_side { c.x } else { c.y }), adds, dels }
+                })
+                .collect()
+        };
+        let (u, s) = (entries(false), entries(true));
+        self.unstaged_tree.set(u);
+        self.staged_tree.set(s);
+    }
+
+    /// The changes tree follows the diff on screen (a commit's, stash's, comparison's).
+    fn sync_changes_tree(&mut self) {
+        if self.showing_wip() {
+            return;
+        }
+        let (adds, dels) = self.diff.files.iter().fold((0, 0), |(a, d), f| (a + f.adds, d + f.dels));
+        let sig = format!("{}\n{}:{adds}:{dels}", self.diff.key, self.diff.files.len());
+        if sig == self.changes_sig {
+            return;
+        }
+        let same_diff = self.changes_sig.split('\n').next() == Some(self.diff.key.as_str());
+        self.changes_sig = sig;
+        let entries = self
+            .diff
+            .files
+            .iter()
+            .zip(&self.diff.status)
+            .map(|(f, st)| {
+                let from = match st {
+                    crate::diffview::FileStatus::Renamed(from) => Some(from.clone()),
+                    _ => None,
+                };
+                Entry { path: f.path.clone(), from, badge: st.badge(), adds: f.adds, dels: f.dels }
+            })
+            .collect();
+        self.changes_tree.set(entries);
+        // Another commit (stash, comparison) starts with every folder open, at the top.
+        if !same_diff {
+            self.changes_tree.open_all();
+            self.changes_tree.scroll = Scroll::default();
+        }
+    }
+
+    /// The keyboard's row in one of the file lists, while the keys are there.
+    fn tree_cursor_in(&self, t: TreeId) -> Option<String> {
+        let focused = self.kb && self.focus == Focus::None && matches!(self.pane, Pane::Files | Pane::Stash);
+        if !focused {
+            return None;
+        }
+        self.tree_at().filter(|(id, _)| *id == t).map(|(_, p)| p)
+    }
+
+    /// Shows a working-copy file's diff (its unstaged or its staged changes).
+    fn show_wip_file(&mut self, path: String, staged: bool) {
+        let f = (path, staged);
+        if self.wip_file.as_ref() != Some(&f) {
+            self.wip_file = Some(f);
+            self.diff.selected.clear();
+            self.load_wip_diff();
+        }
+    }
+
+    /// The changes tree: the file the diff is at is selected; clicking a file takes the diff
+    /// there (its index comes back).
+    fn draw_changes_tree(&mut self, ui: &mut Ui, r: Rect, split: bool) -> Option<usize> {
+        self.sync_changes_tree();
+        let current = self.diff.current_file(split).and_then(|i| self.diff.files.get(i)).map(|f| f.path.clone());
+        let cursor = self.tree_cursor_in(TreeId::Changes);
+        let look = Look { selected: current.as_deref(), cursor: cursor.as_deref(), buttons: &[], empty: "No changes" };
+        match self.changes_tree.draw(ui, r, &look)? {
+            Click::File(p, _) => {
+                let fi = self.diff.files.iter().position(|f| f.path == p);
+                self.tree_cursor = Some((TreeId::Changes, p));
+                fi
+            }
+            Click::Dir(d) => {
+                self.tree_cursor = Some((TreeId::Changes, d));
+                None
+            }
+            Click::Button(..) => None,
+        }
+    }
+
+    /// One of the working copy's lists.
+    fn draw_wip_tree(&mut self, ui: &mut Ui, r: Rect, staged: bool) -> Option<Click> {
+        let cursor = self.tree_cursor_in(if staged { TreeId::Staged } else { TreeId::Unstaged });
+        let selected = self.wip_file.as_ref().filter(|(_, s)| *s == staged).map(|(p, _)| p.clone());
+        let buttons: &[(&'static str, bool)] = if staged { &[("Unstage", false)] } else { &[("Discard", true), ("Stage", false)] };
+        let empty = if staged { "Nothing staged" } else { "No unstaged changes" };
+        let look = Look { selected: selected.as_deref(), cursor: cursor.as_deref(), buttons, empty };
+        if staged { self.staged_tree.draw(ui, r, &look) } else { self.unstaged_tree.draw(ui, r, &look) }
+    }
+
+    /// A click in the working copy's lists: a file shows (a double click stages or unstages
+    /// it), a folder opens or closes, a row's button acts on its files (a folder's: all).
+    fn wip_tree_click(&mut self, c: Click, staged: bool) {
+        let id = if staged { TreeId::Staged } else { TreeId::Unstaged };
+        match c {
+            Click::File(p, true) => self.stage_paths(&[p], !staged),
+            Click::File(p, false) => {
+                self.tree_cursor = Some((id, p.clone()));
+                self.show_wip_file(p, staged);
+            }
+            Click::Dir(d) => self.tree_cursor = Some((id, d)),
+            Click::Button("Stage", paths) => self.stage_paths(&paths, true),
+            Click::Button("Unstage", paths) => self.stage_paths(&paths, false),
+            Click::Button(_, paths) => self.discard_files(&paths),
+        }
+    }
+
+    /// Stages (or unstages) these files.
+    fn stage_paths(&mut self, paths: &[String], stage: bool) {
+        let Some(repo) = &self.repo else { return };
+        let p: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let r = if stage { repo.stage(&p) } else { repo.unstage(&p) };
+        self.result(r, "");
+        self.reload_status();
+    }
+
+    /// Discards these files' unstaged changes (deletes them, if untracked), as one undo step.
+    fn discard_files(&mut self, paths: &[String]) {
+        let mut done = Vec::new();
+        for p in paths {
+            match self.discard_file(p) {
+                Ok(u) => done.push(u),
+                Err(e) => self.toast_err(e),
+            }
+        }
+        match done.len() {
+            0 => {}
+            1 => self.push_undo(done.pop().unwrap()),
+            n => self.push_undo(Undo::Many(done, format!("discard {n} files"))),
+        }
+        self.reload_status();
     }
 
     /// The right-hand panel shows the working copy (not a commit, a comparison or a stash).
@@ -1084,7 +1252,6 @@ impl GitApp {
                 self.info = repo.commit_info(&c.hash).ok();
                 let src = Self::commit_blame(repo, &c);
                 Self::replace_diff(&mut self.diff, DiffView::new(files, DiffMode::Commit, c.hash.clone()).with_blame(src));
-                self.files_scroll = Scroll::default();
                 if let Some(fv) = &mut self.file_view {
                     if fv.rev.is_some() {
                         // Time travel: the open file follows the selection through history.
@@ -1123,7 +1290,7 @@ impl GitApp {
         if a == b {
             return;
         }
-        self.compare = Some(Compare { a, b, merge_base, ahead: 0, behind: 0, range: HashSet::new(), files_scroll: Scroll::default() });
+        self.compare = Some(Compare { a, b, merge_base, ahead: 0, behind: 0, range: HashSet::new() });
         self.file_view = None;
         self.load_compare();
     }
@@ -1376,18 +1543,7 @@ impl GitApp {
             }
             Act::DiscardAll => {
                 let paths: Vec<String> = self.changes.iter().filter(|c| c.unstaged()).map(|c| c.path.clone()).collect();
-                let mut done = Vec::new();
-                for p in &paths {
-                    match self.discard_file(p) {
-                        Ok(u) => done.push(u),
-                        Err(e) => self.toast_err(e),
-                    }
-                }
-                if !done.is_empty() {
-                    let n = done.len();
-                    self.push_undo(Undo::Many(done, format!("discard {n} file{}", if n == 1 { "" } else { "s" })));
-                }
-                self.reload_status();
+                self.discard_files(&paths);
             }
             Act::Commit => self.commit(),
             Act::ToggleAmend => {
@@ -1582,7 +1738,7 @@ impl GitApp {
                 self.spawn(&format!("Pushing tag {t} to {remote}"), own(&["push", &remote, &format!("refs/tags/{t}")]));
             }
             Act::PushTag { tag: None, remote } => self.spawn(&format!("Pushing tags to {remote}"), own(&["push", &remote, "--tags"])),
-            Act::Key(cmd) => self.run_cmd(cmd),
+            Act::Press(k) => self.pending_keys.push(k),
             Act::CopyText(text) => {
                 crate::clipboard::copy(&text);
                 let shown: String = text.lines().next().unwrap_or("").chars().take(60).collect();
@@ -1646,13 +1802,8 @@ impl GitApp {
                 }
                 self.reload_status();
             }
-            Act::DiscardFile(path) => {
-                match self.discard_file(&path) {
-                    Ok(u) => self.push_undo(u),
-                    Err(e) => self.toast_err(e),
-                }
-                self.reload_status();
-            }
+            Act::DiscardFile(path) => self.discard_files(&[path]),
+            Act::DiscardFiles(paths) => self.discard_files(&paths),
             Act::StashMenu => {
                 let items = self.stash_menu_items();
                 self.kb_menu("Stash".into(), None, items);
@@ -2200,6 +2351,9 @@ impl GitApp {
         self.poll_job(ui);
         self.poll_wt_jobs(ui);
         self.tick_playback(ui);
+        for k in self.pending_keys.drain(..) {
+            ui.input.push_key(keys::press(k));
+        }
         self.global_keys(ui);
         self.click_focus(ui);
         self.pane_rects.clear();
@@ -2295,9 +2449,11 @@ impl GitApp {
         }
     }
 
+    /// Every key goes through a binding offered here (or by the resolver as it draws): see
+    /// `Ui::key`. What has the keys decides what's offered: a menu, the palette, the commit
+    /// message, the resolver, or the focused pane.
     fn global_keys(&mut self, ui: &mut Ui) {
-        let input = &mut ui.input;
-        if input.take_key(Key::Char('k'), true).is_some() || input.take_key(Key::Char('p'), true).is_some() {
+        if ui.key(bind(&["<m-k>", "<m-p>"], "Command palette")) {
             if self.focus == Focus::Palette {
                 self.focus = Focus::None;
             } else {
@@ -2305,30 +2461,27 @@ impl GitApp {
                 self.palette.reset("");
             }
         }
-        if ui.input.take_key(Key::Char('r'), true).is_some() {
+        if ui.key(bind(&["<m-r>"], "Refresh")) {
             self.act(Act::Refresh);
         }
-        if self.focus == Focus::Message && ui.input.take_key(Key::Enter, true).is_some() {
-            self.commit();
-        }
-        if self.focus == Focus::Message && ui.input.take_key(Key::Escape, false).is_some() {
-            self.focus = Focus::None;
-        }
-        if self.focus == Focus::Message {
-            self.message_keys(ui);
-        }
-        if self.focus != Focus::None {
+        if self.menu.is_some() {
+            self.menu_keys(ui);
             return;
         }
-        if ui.input.take_key(Key::Char('z'), true).is_some() {
+        match self.focus {
+            Focus::Palette => return self.palette_keys(ui),
+            Focus::Message => return self.message_keys(ui),
+            Focus::None => {}
+        }
+        if ui.key(bind(&["<m-z>"], "Undo")) {
             self.undo();
         }
-        // The resolver has keys of its own; the workspace's menu may be open over everything.
+        // The resolver offers its own keys as it draws; the workspace's menu may be open over
+        // everything.
         if self.resolving.is_some() || ui.blocked {
             return;
         }
-        // Everything else is lazygit's keymap (keys.rs), for the focused pane.
-        self.keyboard(ui);
+        self.pane_keys(ui);
     }
 
     // ---- top bar / chrome -------------------------------------------------------------------
@@ -3367,80 +3520,6 @@ impl GitApp {
         }
     }
 
-    /// One list of changed files (unstaged or staged). Returns (clicked, toggled, discarded) paths.
-    fn file_list(&mut self, ui: &mut Ui, r: Rect, staged: bool) -> (Option<String>, Option<String>, Option<String>) {
-        let files: Vec<&Change> = self.changes.iter().filter(|c| !c.conflicted() && if staged { c.staged() } else { c.unstaged() }).collect();
-        let scroll = if staged { &mut self.staged_scroll } else { &mut self.unstaged_scroll };
-        let off = scroll.update(ui, r, files.len() as f32 * LIST_ROW_H);
-        self.list_view_h[staged as usize] = r.h;
-        let (mut click, mut toggle, mut discard) = (None, None, None);
-        ui.p.push_clip(r);
-        if files.is_empty() {
-            let msg = if staged { "Nothing staged" } else { "No unstaged changes" };
-            ui.p.text(r.x + 16.0, r.y + LIST_ROW_H * 0.5, UI, 12.0, msg, theme::FAINT);
-        }
-        for (i, c) in files.iter().enumerate() {
-            let row = Rect::new(r.x + 6.0, r.y + i as f32 * LIST_ROW_H - off, r.w - 12.0, LIST_ROW_H);
-            if row.bottom() < r.y || row.y > r.bottom() {
-                continue;
-            }
-            let selected = self.wip_file.as_ref().is_some_and(|(p, s)| p == &c.path && *s == staged);
-            let hov = ui.hovered(row);
-            if selected || hov {
-                ui.p.rounded(row, 5.0, if selected { theme::SELECT } else { theme::HOVER });
-            }
-            let code = if staged { c.x } else { c.y };
-            let (letter, color) = match code {
-                _ if c.conflicted() => ('!', theme::RED),
-                'M' => ('M', theme::YELLOW),
-                'A' => ('A', theme::GREEN),
-                'D' => ('D', theme::RED),
-                'R' => ('R', theme::PURPLE),
-                'C' => ('C', theme::PURPLE),
-                '?' => ('N', theme::GREEN),
-                'T' => ('T', theme::CYAN),
-                other => (other, theme::DIM),
-            };
-            let badge = Rect::new(row.x + 6.0, row.cy() - 8.0, 16.0, 16.0);
-            ui.p.rounded(badge, 4.0, color.alpha(0.16));
-            let lw = ui.p.measure(MONO, 10.5, &letter.to_string());
-            ui.p.text(badge.x + (16.0 - lw) * 0.5, badge.cy(), MONO, 10.5, &letter.to_string(), color);
-            let (dir, name) = match c.path.rfind('/') {
-                Some(p) => (&c.path[..p + 1], &c.path[p + 1..]),
-                None => ("", c.path.as_str()),
-            };
-            let btn_w = if hov { if staged { 66.0 } else { 136.0 } } else { 0.0 };
-            let avail = row.w - 34.0 - btn_w;
-            let x = row.x + 30.0;
-            let nw = ui.p.text_fit(x, row.cy(), avail, UI, 12.5, name, theme::TEXT);
-            let detail = match &c.orig {
-                Some(o) => format!("← {o}"),
-                None => dir.trim_end_matches('/').to_string(),
-            };
-            if !detail.is_empty() {
-                ui.p.text_fit(x + nw + 6.0, row.cy(), avail - nw - 6.0, UI, 11.5, &detail, theme::FAINT);
-            }
-            if hov {
-                let b = Rect::new(row.right() - 64.0, row.y + 2.0, 60.0, LIST_ROW_H - 4.0);
-                let d = Rect::new(row.right() - 134.0, row.y + 2.0, 66.0, LIST_ROW_H - 4.0);
-                if ui.button(b, if staged { "Unstage" } else { "Stage" }, false, true) {
-                    toggle = Some(c.path.clone());
-                } else if !staged && ui.danger_button(d, "Discard") {
-                    discard = Some(c.path.clone());
-                } else if ui.input.pressed {
-                    if ui.input.double {
-                        toggle = Some(c.path.clone());
-                    } else {
-                        click = Some(c.path.clone());
-                    }
-                }
-                ui.cursor = Cursor::Pointer;
-            }
-        }
-        ui.p.pop_clip();
-        (click, toggle, discard)
-    }
-
     /// Wide mode splits the working copy and commit panels into two columns (when there's room).
     fn columns(&self, r: Rect) -> bool {
         self.wide && r.w >= 860.0
@@ -3513,12 +3592,16 @@ impl GitApp {
             let lr = area.take_top(list_h(conflicts.len()));
             ui.p.push_clip(lr);
             let mut act = None;
+            let cursor = self.tree_cursor_in(TreeId::Conflicts);
             for (i, path) in conflicts.iter().enumerate() {
                 let row = Rect::new(lr.x + 6.0, lr.y + i as f32 * LIST_ROW_H, lr.w - 12.0, LIST_ROW_H);
                 let selected = self.wip_file.as_ref().is_some_and(|(p, _)| p == path);
                 let hov = ui.hovered(row);
                 if selected || hov {
                     ui.p.rounded(row, 5.0, if selected { theme::SELECT } else { theme::HOVER });
+                }
+                if cursor.as_ref() == Some(path) {
+                    ui.p.rounded_stroke(row, 5.0, 1.5, theme::ACCENT);
                 }
                 let badge = Rect::new(row.x + 6.0, row.cy() - 8.0, 16.0, 16.0);
                 ui.p.rounded(badge, 4.0, theme::RED.alpha(0.18));
@@ -3562,8 +3645,7 @@ impl GitApp {
         let composer_r = if columns { area.take_bottom((area.h * 0.28).clamp(132.0, 220.0)) } else { Rect::default() };
         let (unstaged_h, staged_h) = if columns {
             let avail = (area.h - 60.0).max(2.0 * LIST_ROW_H);
-            let need = |n: usize| n.max(1) as f32 * LIST_ROW_H + 4.0;
-            let (nu, ns) = (need(n_unstaged), need(n_staged));
+            let (nu, ns) = (self.unstaged_tree.height(), self.staged_tree.height());
             let half = avail * 0.5;
             if nu + ns <= avail || nu <= half {
                 (nu, avail - nu)
@@ -3573,7 +3655,8 @@ impl GitApp {
                 (half, avail - half)
             }
         } else {
-            (list_h(n_unstaged), list_h(n_staged))
+            let fit = |t: &FileTree| t.height().min(LIST_ROW_H * 7.0 + 4.0);
+            (fit(&self.unstaged_tree), fit(&self.staged_tree))
         };
 
         // Unstaged
@@ -3590,7 +3673,7 @@ impl GitApp {
             }
         }
         let lr = area.take_top(unstaged_h);
-        let (c1, t1, d1) = self.file_list(ui, lr, false);
+        let c1 = self.draw_wip_tree(ui, lr, false);
 
         // Staged
         let hdr = area.take_top(30.0);
@@ -3601,7 +3684,7 @@ impl GitApp {
             return;
         }
         let lr = area.take_top(staged_h);
-        let (c2, t2, _) = self.file_list(ui, lr, true);
+        let c2 = self.draw_wip_tree(ui, lr, true);
 
         // Commit composer
         let mut composer = if columns {
@@ -3653,33 +3736,13 @@ impl GitApp {
             self.apply_diff_action(a);
         }
 
-        for (path, staged) in [(c1, false), (c2, true)] {
-            if let Some(p) = path {
-                self.wip_file = Some((p, staged));
-                self.diff.selected.clear();
-                self.load_wip_diff();
+        for (click, staged) in [(c1, false), (c2, true)] {
+            if let Some(c) = click {
+                self.wip_tree_click(c, staged);
             }
-        }
-        if let Some(p) = t1 {
-            let r = self.repo.as_ref().unwrap().stage(&[&p]);
-            self.result(r, "");
-            self.reload_status();
-        }
-        if let Some(p) = t2 {
-            let r = self.repo.as_ref().unwrap().unstage(&[&p]);
-            self.result(r, "");
-            self.reload_status();
-        }
-        if let Some(p) = d1 {
-            match self.discard_file(&p) {
-                Ok(u) => self.push_undo(u),
-                Err(e) => self.toast_err(e),
-            }
-            self.reload_status();
         }
     }
 
-    /// Subject, hash, author, date, parents and (up to `max_body` lines of) the message.
     /// Shows a stash in the right-hand panel, over the selection until it's closed.
     fn open_stash(&mut self, hash: &str) {
         let Some(repo) = &self.repo else { return };
@@ -3693,8 +3756,7 @@ impl GitApp {
         };
         Self::replace_diff(&mut self.diff, DiffView::new(files, DiffMode::Commit, format!("stash:{hash}")));
         if self.stash_view.as_deref() != Some(hash) {
-            self.files_scroll = Scroll::default();
-            self.file_cursor = 0;
+            self.tree_cursor = None;
         }
         self.stash_view = Some(hash.to_string());
         self.compare = None;
@@ -3827,6 +3889,7 @@ impl GitApp {
         self.reload_all(false);
     }
 
+    /// Subject, hash, author, date, parents and (up to `max_body` lines of) the message.
     fn commit_header(&mut self, ui: &mut Ui, area: &mut Rect, c: &Commit, max_body: usize) -> Option<String> {
         let pad = 16.0;
         let width = area.w - 2.0 * pad;
@@ -3957,54 +4020,6 @@ impl GitApp {
         ui.p.pop_clip();
     }
 
-    /// File index for a diff: status badge, name, path, stats; tracks the scrolled-to file.
-    fn diff_file_index(&mut self, ui: &mut Ui, r: Rect, scroll: &mut Scroll, split: bool) -> Option<usize> {
-        ui.p.rect(r, theme::PANEL);
-        let rh = 26.0;
-        let n = self.diff.files.len();
-        let off = scroll.update(ui, r, n as f32 * rh + 8.0);
-        let current = self.diff.current_file(split);
-        let mut jump = None;
-        ui.p.push_clip(r);
-        for fi in 0..n {
-            let row = Rect::new(r.x + 6.0, r.y + 4.0 + fi as f32 * rh - off, r.w - 12.0, rh);
-            if row.bottom() < r.y || row.y > r.bottom() {
-                continue;
-            }
-            let hov = ui.hovered(row);
-            if current == Some(fi) {
-                ui.p.rounded(row, 5.0, theme::SELECT.alpha(0.7));
-            } else if hov {
-                ui.p.rounded(row, 5.0, theme::HOVER);
-            }
-            if hov {
-                ui.cursor = Cursor::Pointer;
-                if ui.input.pressed {
-                    jump = Some(fi);
-                }
-            }
-            let (letter, color) = self.diff.status[fi].badge();
-            let badge = Rect::new(row.x + 6.0, row.cy() - 8.0, 16.0, 16.0);
-            ui.p.rounded(badge, 4.0, color.alpha(0.16));
-            ui.p.text(badge.x + 4.0, badge.cy(), MONO, 10.5, &letter.to_string(), color);
-            let f = &self.diff.files[fi];
-            let stat = format!("+{} -{}", f.adds, f.dels);
-            let sw = ui.p.measure(MONO, 10.5, &stat);
-            let (dir, name) = match f.path.rfind('/') {
-                Some(p) => (&f.path[..p], &f.path[p + 1..]),
-                None => ("", f.path.as_str()),
-            };
-            let avail = row.w - 40.0 - sw;
-            let nw = ui.p.text_fit(row.x + 30.0, row.cy(), avail, UI, 12.5, name, theme::TEXT);
-            if !dir.is_empty() {
-                ui.p.text_fit(row.x + 36.0 + nw, row.cy(), avail - nw - 6.0, UI, 11.0, dir, theme::FAINT);
-            }
-            ui.p.text(row.right() - sw - 6.0, row.cy(), MONO, 10.5, &stat, theme::FAINT);
-        }
-        ui.p.pop_clip();
-        jump
-    }
-
     fn compare_chip(ui: &mut Ui, x: f32, cy: f32, letter: &str, color: Color, label: &str, detail: &str, max_w: f32) -> f32 {
         let lw = ui.p.measure(UI, 12.5, label);
         let dw = ui.p.measure(UI, 11.5, detail).min((max_w - lw - 50.0).max(0.0));
@@ -4086,8 +4101,9 @@ impl GitApp {
         self.diff_toolbar(ui, bar);
 
         let narrow = area.w < 760.0;
+        self.sync_changes_tree();
         let list_r = if narrow {
-            area.take_top((self.diff.files.len().max(1) as f32 * 26.0 + 8.0).min(150.0))
+            area.take_top(self.changes_tree.height().min(150.0))
         } else {
             area.take_left(260.0)
         };
@@ -4097,11 +4113,7 @@ impl GitApp {
             ui.p.rect(Rect::new(area.x, area.y, 1.0, area.h), theme::BORDER);
         }
         let split = self.split_for(area.w);
-        let mut scroll = self.compare.as_mut().map(|c| std::mem::take(&mut c.files_scroll)).unwrap_or_default();
-        let jump = self.diff_file_index(ui, list_r, &mut scroll, split);
-        if let Some(c) = &mut self.compare {
-            c.files_scroll = scroll;
-        }
+        let jump = self.draw_changes_tree(ui, list_r, split);
         let diff_r = if narrow { area } else { Rect::new(area.x + 1.0, area.y, area.w - 1.0, area.h) };
         self.main_rect = Some(diff_r);
         let action = self.diff.draw(ui, diff_r, split, self.authors);
@@ -4247,50 +4259,14 @@ impl GitApp {
         hx += ui.p.text(hx, hdr.cy(), UI, 11.0, &format!("{nf} FILE{}  ·  ", if nf == 1 { "" } else { "S" }), theme::FAINT);
         hx += ui.p.text(hx, hdr.cy(), MONO, 11.0, &format!("+{adds} "), theme::GREEN);
         ui.p.text(hx, hdr.cy(), MONO, 11.0, &format!("-{dels}"), theme::RED);
+        self.sync_changes_tree();
         let list_r = match diff_area {
             Some(_) => area,
-            None => area.take_top((nf.max(1) as f32 * 22.0).min(22.0 * 6.0) + 6.0),
+            None => area.take_top(self.changes_tree.height().min(filetree::ROW_H * 6.0 + 6.0)),
         };
         let mut diff_r = diff_area.unwrap_or(area);
         let split = self.split_for(diff_r.w);
-        let off = self.files_scroll.update(ui, list_r, nf as f32 * 22.0);
-        self.list_view_h[0] = list_r.h;
-        // The keyboard's file when it's driving this list, else the one the diff is showing.
-        let current = if self.kb && matches!(self.pane, Pane::Files | Pane::Stash) { Some(self.file_cursor) } else { self.diff.current_file(split) };
-        let mut jump = None;
-        ui.p.push_clip(list_r);
-        for (fi, f) in self.diff.files.iter().enumerate() {
-            let row = Rect::new(list_r.x + 6.0, list_r.y + fi as f32 * 22.0 - off, list_r.w - 12.0, 22.0);
-            if row.bottom() < list_r.y || row.y > list_r.bottom() {
-                continue;
-            }
-            let hov = ui.hovered(row);
-            if current == Some(fi) {
-                ui.p.rounded(row, 5.0, theme::SELECT.alpha(0.6));
-            }
-            if hov {
-                ui.p.rounded(row, 5.0, theme::HOVER);
-                ui.cursor = Cursor::Pointer;
-                if ui.input.pressed {
-                    jump = Some(fi);
-                }
-            }
-            let total = (f.adds + f.dels).max(1) as f32;
-            let bar = Rect::new(row.x + 8.0, row.cy() - 3.0, 36.0, 6.0);
-            ui.p.rounded(bar, 3.0, theme::RAISED);
-            let gw = bar.w * f.adds as f32 / total;
-            if f.adds > 0 {
-                ui.p.rounded(Rect::new(bar.x, bar.y, gw.max(3.0), bar.h), 3.0, theme::GREEN.alpha(0.85));
-            }
-            if f.dels > 0 {
-                ui.p.rounded(Rect::new(bar.x + gw, bar.y, (bar.w - gw).max(3.0), bar.h), 3.0, theme::RED.alpha(0.85));
-            }
-            ui.p.text_fit(row.x + 54.0, row.cy(), row.w - 130.0, UI, 12.5, &f.path, theme::TEXT);
-            let stat = format!("+{} -{}", f.adds, f.dels);
-            let sw = ui.p.measure(MONO, 11.0, &stat);
-            ui.p.text(row.right() - sw - 8.0, row.cy(), MONO, 11.0, &stat, theme::FAINT);
-        }
-        ui.p.pop_clip();
+        let jump = self.draw_changes_tree(ui, list_r, split);
 
         // Same toolbar height as in the wide working copy, so the diff doesn't shift between them.
         let bar = diff_r.take_top(if diff_area.is_some() { 44.0 } else { 34.0 });
@@ -4301,7 +4277,6 @@ impl GitApp {
         }
         if let Some(fi) = jump {
             self.diff.jump_to_file(fi, split);
-            self.file_cursor = fi;
         }
     }
 
@@ -4811,34 +4786,14 @@ impl GitApp {
         items
     }
 
+    /// Draws the palette (its keys are `palette_keys`); typing goes to its text field.
     fn palette(&mut self, ui: &mut Ui) {
-        let input = &mut ui.input;
-        if input.take_key(Key::Escape, false).is_some() {
-            self.focus = Focus::None;
-            return;
-        }
-        let n = self.palette.items.len();
-        if input.take_key(Key::Down, false).is_some() && n > 0 {
-            self.palette.sel = (self.palette.sel + 1).min(n - 1);
-        }
-        if input.take_key(Key::Up, false).is_some() {
-            self.palette.sel = self.palette.sel.saturating_sub(1);
-        }
-        let enter = input.take_key(Key::Enter, false).is_some();
         self.palette.input.handle(&mut ui.input, false);
         if self.palette.query.as_deref() != Some(self.palette.input.text.as_str()) {
             self.palette.query = Some(self.palette.input.text.clone());
             self.build_palette_items();
             self.palette.sel = 0;
             self.palette.scroll = Scroll::default();
-        }
-        if enter {
-            if let Some(item) = self.palette.items.get(self.palette.sel) {
-                let a = item.act.clone();
-                self.focus = Focus::None;
-                self.act(a);
-                return;
-            }
         }
 
         let s = ui.screen;
@@ -5376,10 +5331,6 @@ impl GitApp {
     }
 
     fn draw_menu(&mut self, ui: &mut Ui) {
-        if ui.input.take_key(Key::Escape, false).is_some() {
-            self.menu = None;
-            return;
-        }
         let Some(m) = &self.menu else { return };
         let row_h = MENU_ROW_H;
         // An item's keys, as key caps (a few at most).
@@ -5733,6 +5684,19 @@ fn added_worktrees(u: &Undo) -> Vec<PathBuf> {
     }
 }
 
+/// A status letter as the file lists show it.
+fn status_badge(code: char) -> (char, Color) {
+    match code {
+        'M' => ('M', theme::YELLOW),
+        'A' => ('A', theme::GREEN),
+        'D' => ('D', theme::RED),
+        'R' | 'C' => (code, theme::PURPLE),
+        '?' => ('N', theme::GREEN),
+        'T' => ('T', theme::CYAN),
+        other => (other, theme::DIM),
+    }
+}
+
 /// Whether git takes `name` for a tag or branch (the rules of `git check-ref-format`).
 fn valid_ref_name(name: &str) -> bool {
     !name.is_empty()
@@ -5776,7 +5740,7 @@ fn open_external(path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::KeyPress;
+    use crate::ui::{Key, KeyPress};
 
     fn temp_repo(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("wgitpui-app-{name}-{}", std::process::id()));
@@ -5825,7 +5789,7 @@ mod tests {
             self.frame();
         }
         fn key(&mut self, key: Key) {
-            self.ui.input.keys.push(KeyPress { key, mods: Default::default() });
+            self.ui.input.push_key(KeyPress { key, mods: Default::default() });
             self.frame();
         }
         fn branch(&self) -> String {
@@ -5877,7 +5841,7 @@ mod tests {
         assert_eq!(h.branch(), "topic");
         // ⌘Z / Ctrl+Z undoes: back on main, branch gone.
         let mods = crate::ui::Mods { logo: cfg!(target_os = "macos"), ctrl: !cfg!(target_os = "macos"), ..Default::default() };
-        h.ui.input.keys.push(KeyPress { key: Key::Char('z'), mods });
+        h.ui.input.push_key(KeyPress { key: Key::Char('z'), mods });
         h.frame();
         assert_eq!(h.branch(), "main");
         assert!(h.app.repo.as_ref().unwrap().rev_parse("refs/heads/topic").is_none());
@@ -5969,7 +5933,7 @@ mod tests {
         /// Presses keys written lazygit-style ("j", "J", "<space>", "<c-j>"), a frame each.
         fn keys(&mut self, keys: &str) {
             for k in keys.split_whitespace() {
-                self.ui.input.keys.push(keys::press(k));
+                self.ui.input.push_key(keys::press(k));
                 self.frame();
             }
         }
@@ -6195,6 +6159,35 @@ mod tests {
         h.ui.input.down = false;
         h.frame();
         assert_eq!(h.app.side_col_w(1399.0), 599.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_rows_buttons_act_on_everything_in_it() {
+        let dir = temp_repo("tree-mouse");
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        std::fs::write(dir.join("d/a"), "a").unwrap();
+        std::fs::write(dir.join("d/b"), "b").unwrap();
+        std::fs::write(dir.join("one"), "one, changed").unwrap();
+        let mut h = Harness::new(&dir);
+        h.app.wide = true;
+        h.frame();
+        // Column: "Working copy" header (44), UNSTAGED header (30), then the rows: d/, a, b, one.
+        let row = |i: usize| TOP_H + 44.0 + 30.0 + i as f32 * LIST_ROW_H + LIST_ROW_H * 0.5;
+        let col_right = 1.0 + h.app.side_col_w(1399.0);
+        h.click(col_right - 6.0 - 30.0, row(0));
+        let staged: Vec<&str> = h.app.changes.iter().filter(|c| c.staged()).map(|c| c.path.as_str()).collect();
+        assert_eq!(staged, ["d/a", "d/b"]);
+        // The staged list (below "one" and the STAGED header): clicking its folder closes it,
+        // clicking again opens it.
+        let staged_rows = |h: &Harness| h.app.staged_tree.rows().iter().map(|r| r.path.clone()).collect::<Vec<_>>();
+        assert_eq!(staged_rows(&h), ["d/", "d/a", "d/b"]);
+        let folder = TOP_H + 44.0 + 30.0 + h.app.unstaged_tree.height() + 30.0 + LIST_ROW_H * 0.5;
+        h.click(100.0, folder);
+        assert_eq!(staged_rows(&h), ["d/"]);
+        h.frame();
+        h.click(100.0, folder);
+        assert_eq!(staged_rows(&h).len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6521,7 +6514,7 @@ mod tests {
         h.type_text("The details.");
         h.keys("<enter>");
         assert_eq!(h.app.msg.text, "Keyboard commit\n\nThe details.\n", "enter in the description is a new line");
-        h.ui.input.keys.push(keys::press("<backspace>"));
+        h.ui.input.push_key(keys::press("<backspace>"));
         h.frame();
         h.keys("<tab>");
         assert_eq!(h.app.msg.cursor, "Keyboard commit".len());
@@ -6715,12 +6708,129 @@ mod tests {
     }
 
     #[test]
+    fn file_lists_are_folder_trees_for_the_keys_too() {
+        let dir = temp_repo("kb-tree");
+        let git = |args: &[&str]| git::run(&dir, args, None).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        // Long enough that the commit's diff scrolls.
+        let old: String = (0..80).map(|i| format!("old {i}\n")).collect();
+        for f in ["src/a.rs", "src/b.rs", "docs/x.md"] {
+            std::fs::write(dir.join(f), &old).unwrap();
+        }
+        git(&["add", "."]);
+        git(&["commit", "-qm", "folders"]);
+        for f in ["src/a.rs", "src/b.rs", "docs/x.md", "one"] {
+            std::fs::write(dir.join(f), "new\n").unwrap();
+        }
+        let mut h = Harness::new(&dir);
+        let at = |h: &Harness| h.app.tree_at().map(|(id, p)| format!("{id:?} {p}")).unwrap_or_default();
+        let labels = |h: &Harness| GitApp::key_bar_entries(&h.ui.keymap.now).0.into_iter().map(|e| e.1.to_string()).collect::<Vec<_>>();
+        let staged = |h: &Harness| h.app.changes.iter().filter(|c| c.staged()).map(|c| c.path.clone()).collect::<Vec<_>>();
+        // Folders first; the top file shows.
+        let rows = |t: &FileTree| t.rows().iter().map(|r| r.path.clone()).collect::<Vec<_>>();
+        assert_eq!(rows(&h.app.unstaged_tree), ["docs/", "docs/x.md", "src/", "src/a.rs", "src/b.rs", "one"]);
+        assert_eq!((at(&h), h.app.wip_file.clone()), ("Unstaged docs/x.md".into(), Some(("docs/x.md".into(), false))));
+        // On a file in a folder, h goes up to the folder; on the open folder it closes it; l
+        // opens it again, and then goes into it.
+        assert!(labels(&h).contains(&"folders".to_string()) && labels(&h).contains(&"diff".to_string()), "{:?}", labels(&h));
+        h.keys("h");
+        assert_eq!(at(&h), "Unstaged docs/");
+        assert!(labels(&h).contains(&"open / close".to_string()) && !labels(&h).contains(&"diff".to_string()), "{:?}", labels(&h));
+        h.keys("h");
+        assert_eq!(rows(&h.app.unstaged_tree), ["docs/", "src/", "src/a.rs", "src/b.rs", "one"]);
+        h.keys("l");
+        assert_eq!(rows(&h.app.unstaged_tree).len(), 6);
+        h.keys("l");
+        assert_eq!(at(&h), "Unstaged docs/x.md");
+        // enter on a folder opens and closes it; on a top-level row h is the pane to the left.
+        h.keys("h <enter>");
+        assert!(!h.app.unstaged_tree.is_open("docs/") && h.app.pane == Pane::Files);
+        // j moves over folders too; space on one stages all its files, and the next row
+        // slides under the cursor.
+        h.keys("j");
+        assert_eq!((at(&h), h.app.wip_file.clone()), ("Unstaged src/".into(), Some(("docs/x.md".into(), false))), "the diff stays");
+        h.keys("<space>");
+        assert_eq!(staged(&h), ["src/a.rs", "src/b.rs"]);
+        assert_eq!((at(&h), h.app.wip_file.clone()), ("Unstaged one".into(), Some(("one".into(), false))));
+        // The staged list is a tree as well: l goes into it, h back up, space unstages it all.
+        h.keys("j");
+        assert_eq!(at(&h), "Staged src/");
+        h.keys("l");
+        assert_eq!((at(&h), h.app.wip_file.clone()), ("Staged src/a.rs".into(), Some(("src/a.rs".into(), true))));
+        h.keys("h <space>");
+        assert!(staged(&h).is_empty());
+        // d on a folder: discard everything in it (undoable).
+        h.app.tree_cursor = Some((TreeId::Unstaged, "src/".into()));
+        h.keys("d");
+        assert_eq!(h.menu_labels(), ["Discard changes to 2 files"]);
+        h.keys("<enter>");
+        assert_eq!(std::fs::read_to_string(dir.join("src/a.rs")).unwrap(), old);
+        assert_eq!(rows(&h.app.unstaged_tree), ["docs/", "one"]);
+        h.keys("z");
+        assert_eq!(std::fs::read_to_string(dir.join("src/b.rs")).unwrap(), "new\n");
+        assert!(h.app.unstaged_tree.row_of("src/").is_some());
+        // h on a top-level row moves to the pane on the left, as everywhere.
+        h.app.tree_cursor = Some((TreeId::Unstaged, "one".into()));
+        h.keys("h");
+        assert!(h.app.pane == Pane::Commits);
+
+        // A commit's files: the same tree. The cursor starts where the diff is, and moving it
+        // takes the diff there.
+        git(&["checkout", "-q", "--", "."]);
+        h.app.reload_all(false);
+        h.keys("< j <enter>");
+        assert!(h.app.pane == Pane::Files && h.app.sel_row() == Some(0));
+        assert_eq!(rows(&h.app.changes_tree), ["docs/", "docs/x.md", "src/", "src/a.rs", "src/b.rs"]);
+        assert_eq!(at(&h), "Changes docs/x.md");
+        h.keys("j j");
+        assert_eq!(at(&h), "Changes src/a.rs");
+        assert!(h.app.diff.scroll.target > 0.0, "the diff heads for src/a.rs");
+        h.keys("h h");
+        assert_eq!(rows(&h.app.changes_tree), ["docs/", "docs/x.md", "src/"]);
+        h.keys("<enter>");
+        assert_eq!(rows(&h.app.changes_tree).len(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_comparison_lists_its_files_as_the_same_tree() {
+        let dir = temp_repo("cmp-tree");
+        let git = |args: &[&str]| git::run(&dir, args, None).unwrap();
+        let long: String = (0..80).map(|i| format!("{i}\n")).collect();
+        std::fs::create_dir_all(dir.join("lib/deep")).unwrap();
+        for f in ["lib/deep/a", "lib/b", "z"] {
+            std::fs::write(dir.join(f), &long).unwrap();
+        }
+        git(&["add", "."]);
+        git(&["commit", "-qm", "more"]);
+        let mut h = Harness::new(&dir);
+        h.app.compare_with_row(2);
+        h.frame();
+        assert!(h.app.compare.is_some());
+        let rows: Vec<String> = h.app.changes_tree.rows().iter().map(|r| r.path.clone()).collect();
+        assert_eq!(rows, ["lib/", "lib/deep/", "lib/deep/a", "lib/b", "two", "z"]);
+        // The keys walk it like a commit's, from the diff's first file; the diff follows.
+        h.keys("3");
+        assert_eq!(h.app.tree_at(), Some((TreeId::Changes, "lib/deep/a".to_string())));
+        h.keys("j");
+        assert_eq!(h.app.tree_at(), Some((TreeId::Changes, "lib/b".to_string())));
+        assert!(h.app.diff.scroll.target > 0.0);
+        h.keys("k h h");
+        assert_eq!(h.app.changes_tree.rows().len(), 5, "lib/deep/ closed");
+        h.keys("h h");
+        assert_eq!(h.app.changes_tree.rows().len(), 3, "then lib/");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn key_bar_follows_what_has_the_keys() {
         let dir = temp_repo("keybar-app");
         std::fs::write(dir.join("one"), "changed").unwrap();
         let mut h = Harness::new(&dir);
-        let labels = |h: &Harness| h.app.key_bar_entries().0.into_iter().map(|e| e.1).collect::<Vec<_>>();
-        assert!(labels(&h).starts_with(&["stage".to_string(), "all".into(), "lines".into(), "discard".into()]), "{:?}", labels(&h));
+        // What was on offer in the last frame drawn: exactly what the bar shows.
+        let labels = |h: &Harness| GitApp::key_bar_entries(&h.ui.keymap.now).0.into_iter().map(|e| e.1.to_string()).collect::<Vec<_>>();
+        assert!(labels(&h).starts_with(&["stage".to_string(), "all".into(), "diff".into(), "discard".into()]), "{:?}", labels(&h));
         // In the diff: selecting and staging lines.
         h.keys("<enter>");
         let l = labels(&h);
@@ -6735,6 +6845,62 @@ mod tests {
         assert_eq!(labels(&h), ["move", "run", "close"]);
         h.keys("<esc> c");
         assert_eq!(labels(&h)[..2], ["commit".to_string(), "description".into()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_key_on_the_bar_does_something() {
+        let dir = temp_repo("bar-keys");
+        std::fs::create_dir_all(dir.join("dir")).unwrap();
+        std::fs::write(dir.join("dir/f"), "f").unwrap();
+        git::run(&dir, &["add", "."], None).unwrap();
+        git::run(&dir, &["commit", "-qm", "dir"], None).unwrap();
+        let base = git::run(&dir, &["rev-parse", "HEAD"], None).unwrap().trim().to_string();
+        let change = || {
+            std::fs::write(dir.join("one"), "one, changed").unwrap();
+            std::fs::write(dir.join("dir/f"), "f, changed").unwrap();
+        };
+        change();
+        let entries = |h: &Harness| GitApp::key_bar_entries(&h.ui.keymap.now).0;
+        // In a few places: a file in a folder, the folder, the diff, a commit's files, the
+        // commits, the branch list.
+        let mut tried = HashSet::new();
+        for setup in ["", "h", "<enter>", "2 j <enter>", "2 j", "1"] {
+            // Every key of every entry ("h l  folders" is two).
+            let keys: Vec<(&'static str, &'static str)> = {
+                let mut h = Harness::new(&dir);
+                h.keys(setup);
+                assert!(!entries(&h).is_empty(), "{setup:?}");
+                crate::ui::reachable(&h.ui.keymap.now).iter().filter(|b| !b.bar.is_empty()).map(|b| (b.keys[0], b.bar)).collect()
+            };
+            assert!(!keys.is_empty(), "{setup:?}");
+            for (k, label) in keys {
+                // The same key for the same thing (the global ones) is tried once.
+                if !tried.insert((k, label)) {
+                    continue;
+                }
+                let mut h = Harness::new(&dir);
+                h.keys(setup);
+                h.ui.input.push_key(keys::press(k));
+                // A frame by hand: the harness's would drop leftover keys at its end.
+                h.ui.begin(1400.0, 900.0, 1.0);
+                h.app.frame(&mut h.ui);
+                assert_eq!(h.ui.input.keys_left(), 0, "{k} after {setup:?} reached nothing");
+                h.ui.input.end_frame();
+                // Back to the start (some keys commit, revert or check out).
+                git::run(&dir, &["checkout", "-qf", "main"], None).unwrap();
+                git::run(&dir, &["reset", "-q", "--hard", &base], None).unwrap();
+                git::run(&dir, &["stash", "clear"], None).unwrap();
+                change();
+            }
+        }
+        // And the check bites: a key nothing offers is left over.
+        let mut h = Harness::new(&dir);
+        h.ui.input.push_key(keys::press("<c-x>"));
+        h.ui.begin(1400.0, 900.0, 1.0);
+        h.app.frame(&mut h.ui);
+        assert_eq!(h.ui.input.keys_left(), 1);
+        h.ui.input.end_frame();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

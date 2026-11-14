@@ -7,7 +7,7 @@ use crate::diffview::tok_color;
 use crate::git::{self, Blame, BlameCommit};
 use crate::font::{MONO, UI};
 use crate::syntax::{self, Lang};
-use crate::ui::{theme, Color, Cursor, Key, Rect, Scroll, TextEdit, Ui};
+use crate::ui::{bind, theme, Color, Cursor, Rect, Scroll, TextEdit, Ui};
 
 pub const OURS: Color = theme::ACCENT;
 pub const THEIRS: Color = theme::ORANGE;
@@ -506,40 +506,48 @@ impl ConflictDoc {
         let total = self.total();
         self.focus = self.focus.min(total.saturating_sub(1));
 
-        // ---- keyboard -------------------------------------------------------------------
+        // ---- keyboard (offered, so the key bar lists exactly these) -----------------------
         if let Some((bi, mut ed)) = self.editing.take() {
-            let input = &mut ui.input;
-            if input.take_key(Key::Escape, false).is_some() {
-                // cancelled
-            } else if input.take_key(Key::Enter, true).is_some() {
+            let cancel = ui.key(bind(&["<esc>"], "Cancel the edit").bar("cancel"));
+            let keep = ui.key(bind(&["<m-enter>"], "Keep the edit").bar("keep"));
+            if keep {
                 self.editing = Some((bi, ed));
                 self.finish_edit();
-            } else {
+            } else if !cancel {
                 ed.handle(&mut ui.input, true);
                 self.editing = Some((bi, ed));
             }
         } else {
-            let input = &mut ui.input;
             let f = self.focus;
-            if input.take_key(Key::Char('1'), false).is_some() {
+            let all = self.resolved() == total;
+            if ui.key(bind(&["1"], "Keep yours").bar("yours")) {
                 self.hunk(f, 'o');
-            } else if input.take_key(Key::Char('2'), false).is_some() {
+            }
+            if ui.key(bind(&["2"], "Keep incoming").bar("incoming")) {
                 self.hunk(f, 't');
-            } else if input.take_key(Key::Char('3'), false).is_some() {
+            }
+            if ui.key(bind(&["3"], "Keep both (again: flip their order)").bar("both")) {
                 self.hunk(f, 'b');
-            } else if input.take_key(Key::Char('0'), false).is_some() {
+            }
+            if ui.key(bind(&["0"], "Keep neither").bar("neither")) {
                 self.hunk(f, 'n');
-            } else if input.take_key(Key::Char('e'), false).is_some() {
+            }
+            if ui.key(bind(&["e"], "Edit the conflict by hand").bar("edit")) {
                 self.start_edit(f);
-            } else if input.take_key(Key::Char('v'), false).is_some() {
-                self.preview = !self.preview;
-            } else if input.take_key(Key::Char('n'), false).is_some() || input.take_key(Key::Down, false).is_some() {
+            }
+            if ui.key(bind(&["n", "<down>"], "Next conflict").bar("next")) {
                 self.goto(f + 1);
-            } else if input.take_key(Key::Char('p'), false).is_some() || input.take_key(Key::Up, false).is_some() {
+            }
+            if ui.key(bind(&["p", "<up>"], "Previous conflict").bar("previous")) {
                 self.goto(f.saturating_sub(1));
-            } else if input.take_key(Key::Char('s'), true).is_some() && self.resolved() == total {
+            }
+            if ui.key(bind(&["v"], "Preview the result").bar("preview")) {
+                self.preview = !self.preview;
+            }
+            if ui.key(bind(&["<m-s>"], "Save & mark resolved").bar("save").when(all)) {
                 action = Some(ResolveAction::Save);
-            } else if input.take_key(Key::Escape, false).is_some() {
+            }
+            if ui.key(bind(&["<esc>"], "Back").bar("back")) {
                 action = Some(ResolveAction::Back);
             }
         }

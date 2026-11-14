@@ -700,6 +700,16 @@ impl Repo {
         Ok((index, worktree))
     }
 
+    /// Lines added and removed per file, unstaged (index → files) or staged (HEAD → index).
+    /// Binary files count as 0 / 0.
+    pub fn numstat(&self, staged: bool) -> HashMap<String, (u32, u32)> {
+        let mut args = vec!["diff", "--numstat", "-z", "--no-color", "--no-ext-diff"];
+        if staged {
+            args.push("--cached");
+        }
+        parse_numstat(&self.git(&args).unwrap_or_default())
+    }
+
     /// The stash list, newest first.
     pub fn stashes(&self) -> Vec<Stash> {
         let out = self.git(&["stash", "list", "--format=%gd%x1f%H%x1f%gs%x1f%ct"]).unwrap_or_default();
@@ -1012,6 +1022,40 @@ pub fn change_count(root: &Path) -> usize {
 }
 
 /// Path equality that sees through symlinks (macOS /tmp → /private/tmp) and trailing slashes.
+/// `git diff --numstat -z`: "adds\tdels\tpath\0", or for a rename "adds\tdels\t\0from\0to\0".
+pub fn parse_numstat(out: &str) -> HashMap<String, (u32, u32)> {
+    let mut stats = HashMap::new();
+    let mut fields = out.split('\0');
+    while let Some(rec) = fields.next() {
+        let mut f = rec.splitn(3, '\t');
+        let (Some(a), Some(d), Some(path)) = (f.next(), f.next(), f.next()) else { continue };
+        let path = if path.is_empty() {
+            fields.next();
+            fields.next().unwrap_or("")
+        } else {
+            path
+        };
+        stats.insert(path.to_string(), (a.parse().unwrap_or(0), d.parse().unwrap_or(0)));
+    }
+    stats
+}
+
+/// Lines in a file that isn't tracked yet (0 for a binary or huge one, or once `budget` bytes
+/// have been read: a refresh mustn't read gigabytes of untracked files).
+pub fn line_count(path: &Path, budget: &mut u64) -> u32 {
+    let size = std::fs::metadata(path).ok().filter(|m| m.is_file()).map_or(u64::MAX, |m| m.len());
+    if size > 4_000_000 || size > *budget {
+        return 0;
+    }
+    *budget -= size;
+    match std::fs::read(path) {
+        Ok(b) if !b[..b.len().min(8000)].contains(&0) => {
+            (b.iter().filter(|&&c| c == b'\n').count() + usize::from(b.last().is_some_and(|&c| c != b'\n'))) as u32
+        }
+        _ => 0,
+    }
+}
+
 pub fn same_path(a: &Path, b: &Path) -> bool {
     a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
@@ -1600,6 +1644,27 @@ mod tests {
         repo.stash_push(StashKind::KeepIndex, "keep").unwrap();
         assert_eq!(read("new"), "untracked, changed\n", "the staged file stays");
         assert_eq!(read("f.txt"), "a\nb\nc\nd\n");
+        let _ = std::fs::remove_dir_all(&repo.root);
+    }
+
+    #[test]
+    fn numstat_counts_lines_renames_included() {
+        let stats = parse_numstat("3\t1\tsrc/a.rs\0-\t-\tlogo.png\x000\t0\t\0old name\0new name\0");
+        assert_eq!(stats["src/a.rs"], (3, 1));
+        assert_eq!(stats["logo.png"], (0, 0));
+        assert_eq!(stats["new name"], (0, 0));
+        assert_eq!(stats.len(), 3);
+        let repo = temp_repo("numstat");
+        std::fs::write(repo.root.join("f.txt"), "a\nB\nc\nd\ne\n").unwrap();
+        assert_eq!(repo.numstat(false)["f.txt"], (2, 1));
+        repo.stage(&["f.txt"]).unwrap();
+        assert!(repo.numstat(false).is_empty());
+        assert_eq!(repo.numstat(true)["f.txt"], (2, 1));
+        std::fs::write(repo.root.join("u"), "1\n2\n3").unwrap();
+        let mut budget = 10;
+        assert_eq!(line_count(&repo.root.join("u"), &mut budget), 3);
+        assert_eq!((budget, line_count(&repo.root.join("u"), &mut budget)), (5, 3));
+        assert_eq!(line_count(&repo.root.join("u"), &mut budget), 0, "over the budget");
         let _ = std::fs::remove_dir_all(&repo.root);
     }
 

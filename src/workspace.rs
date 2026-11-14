@@ -6,7 +6,7 @@ use crate::chrome;
 use crate::config::{self, Config};
 use crate::font::UI;
 use crate::git::Repo;
-use crate::ui::{theme, Color, Cursor, Key, Rect, Ui};
+use crate::ui::{bind, theme, Color, Cursor, Rect, Ui};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -265,42 +265,29 @@ impl Workspace {
         self.draw_error(ui);
     }
 
+    /// The tab shortcuts, offered like every other key (`Ui::key`).
     fn keys(&mut self, ui: &mut Ui) {
-        let input = &mut ui.input;
-        let mut take = |pred: &dyn Fn(Key, crate::ui::Mods) -> bool| -> bool {
-            match input.keys.iter().position(|k| pred(k.key, k.mods)) {
-                Some(i) => {
-                    input.keys.remove(i);
-                    true
-                }
-                None => false,
-            }
-        };
         let n = self.tabs.len();
-        if take(&|k, m| k == Key::Char('t') && m.primary()) {
+        if ui.key(bind(&["<m-t>"], "New tab (recent repositories)")) {
             self.add_menu = Some(self.plus_at);
             self.add_menu_fresh = true;
         }
-        if take(&|k, m| k == Key::Char('o') && m.primary()) {
+        if ui.key(bind(&["<m-o>"], "Open a repository…")) {
             self.pick_folder();
         }
-        if take(&|k, m| k == Key::Char('w') && m.primary()) && n > 0 {
+        if ui.key(bind(&["<m-w>"], "Close this tab").when(n > 0)) {
             self.close(self.active);
         }
-        for d in 1..=9u8 {
-            let c = (b'0' + d) as char;
-            if take(&|k, m| k == Key::Char(c) && m.primary()) && n > 0 {
-                // ⌘9 is always the last tab, like browsers.
-                let i = if d == 9 { n - 1 } else { d as usize - 1 };
-                self.activate(i.min(n - 1));
-            }
+        let digits = &["<m-1>", "<m-2>", "<m-3>", "<m-4>", "<m-5>", "<m-6>", "<m-7>", "<m-8>", "<m-9>"];
+        if let Some(d) = ui.key_index(bind(digits, "Go to tab 1 … 8 (9: the last one)").when(n > 0)) {
+            // The last digit is always the last tab, like browsers.
+            let i = if d == 8 { n - 1 } else { d };
+            self.activate(i.min(n - 1));
         }
-        let next = take(&|k, m| (k == Key::Tab && m.ctrl && !m.shift) || (m.primary() && m.shift && matches!(k, Key::Char(']') | Key::Char('}'))));
-        let prev = take(&|k, m| (k == Key::Tab && m.ctrl && m.shift) || (m.primary() && m.shift && matches!(k, Key::Char('[') | Key::Char('{'))));
-        if n > 1 && next {
+        if ui.key(bind(&["<c-tab>", "<m-}>", "<m-]>"], "Next tab").when(n > 1)) {
             self.activate((self.active + 1) % n);
         }
-        if n > 1 && prev {
+        if ui.key(bind(&["<c-s-tab>", "<m-{>", "<m-[>"], "Previous tab").when(n > 1)) {
             self.activate((self.active + n - 1) % n);
         }
     }
@@ -435,7 +422,7 @@ impl Workspace {
     }
 
     fn draw_add_menu(&mut self, ui: &mut Ui) {
-        if ui.input.take_key(Key::Escape, false).is_some() {
+        if ui.key(bind(&["<esc>"], "Close").bar("close")) {
             self.add_menu = None;
             return;
         }
@@ -635,6 +622,7 @@ fn save_session(tabs: &[PathBuf], active: usize, recent: &[PathBuf]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::Key;
     use crate::ui::{KeyPress, Mods};
 
     fn repo(name: &str) -> PathBuf {
@@ -658,7 +646,7 @@ mod tests {
 
     fn press(ws: &mut Workspace, ui: &mut Ui, c: char) {
         let mods = Mods { logo: cfg!(target_os = "macos"), ctrl: !cfg!(target_os = "macos"), ..Default::default() };
-        ui.input.keys.push(KeyPress { key: Key::Char(c), mods });
+        ui.input.push_key(KeyPress { key: Key::Char(c), mods });
         frame(ws, ui);
     }
 

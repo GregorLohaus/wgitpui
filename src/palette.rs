@@ -64,8 +64,9 @@ pub enum Act {
     /// Push one tag, or all of them (None), to a remote.
     PushTag { tag: Option<String>, remote: String },
     DeleteTag(String),
-    /// A keyboard command (from the `?` menu).
-    Key(crate::keys::Cmd),
+    /// Press a key next frame (a key bar entry or a `?` item clicked): whatever offers it
+    /// then runs.
+    Press(&'static str),
     /// Put text on the clipboard.
     CopyText(String),
     /// Ask for a commit's new message, then reword it.
@@ -84,6 +85,8 @@ pub enum Act {
     DiscardStaged(String),
     /// Discard a file's unstaged changes (or delete it, if untracked).
     DiscardFile(String),
+    /// The same for several (a folder's).
+    DiscardFiles(Vec<String>),
     /// `git switch -`.
     CheckoutPrev,
     /// Show / hide the key bar along the bottom.

@@ -68,6 +68,13 @@ pub enum Cmd {
     Commit,
     RecentRepos,
     // Files.
+    /// Open or close the folder under the cursor.
+    ToggleFolder,
+    /// h: close the folder, or go up to the one it's in.
+    FolderLeft,
+    /// l: open the folder, or go into it.
+    FolderRight,
+    Resolve,
     ToggleStaged,
     ToggleAll,
     DiscardMenu,
@@ -126,10 +133,13 @@ pub struct Chord {
     shift: bool,
     ctrl: bool,
     alt: bool,
+    /// The platform's command key: ⌘ on macOS, ctrl elsewhere.
+    command: bool,
 }
 
 impl Chord {
-    /// "j", "J", "?", "<c-j>", "<c-R>", "<a-up>", "<s-tab>", "<space>", "<pgdown>".
+    /// "j", "J", "?", "<c-j>", "<c-R>", "<a-up>", "<s-tab>", "<c-s-tab>", "<m-k>" (⌘K),
+    /// "<space>", "<pgdown>".
     pub fn parse(s: &str) -> Chord {
         let named = |n: &str| match n {
             "space" => Key::Char(' '),
@@ -146,31 +156,25 @@ impl Chord {
             "end" => Key::End,
             "backspace" => Key::Backspace,
             "delete" => Key::Delete,
-            _ => {
-                let c = n.chars().next().expect("key");
-                Key::Char(c.to_ascii_lowercase())
-            }
+            _ => Key::Char(n.chars().next().expect("key").to_ascii_lowercase()),
         };
-        let letter_shift = |n: &str| n.chars().count() == 1 && n.chars().next().is_some_and(|c| c.is_ascii_uppercase());
-        match s.strip_prefix('<').and_then(|s| s.strip_suffix('>')).filter(|_| s.len() > 2) {
-            Some(inner) => {
-                let (mods, name) = match inner.split_once('-') {
-                    Some((m, n)) if m.len() == 1 && !n.is_empty() => (m, n),
-                    _ => ("", inner),
-                };
-                Chord { key: named(name), shift: mods == "s" || letter_shift(name), ctrl: mods == "c", alt: mods == "a" }
-            }
-            None => Chord { key: named(s), shift: letter_shift(s), ctrl: false, alt: false },
-        }
+        let upper = |n: &str| n.chars().count() == 1 && n.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+        let Some(inner) = s.strip_prefix('<').and_then(|s| s.strip_suffix('>')).filter(|_| s.len() > 2) else {
+            return Chord { key: named(s), shift: upper(s), ctrl: false, alt: false, command: false };
+        };
+        let parts: Vec<&str> = inner.split('-').collect();
+        let (mods, name) = match parts.split_last() {
+            Some((name, mods)) if !name.is_empty() && mods.iter().all(|m| ["c", "s", "a", "m"].contains(m)) => (mods, *name),
+            _ => (&[][..], inner),
+        };
+        let has = |m: &str| mods.contains(&m);
+        Chord { key: named(name), shift: has("s") || upper(name), ctrl: has("c"), alt: has("a"), command: has("m") }
     }
 
     pub fn matches(&self, k: &KeyPress) -> bool {
         let symbol = matches!(self.key, Key::Char(c) if !c.is_ascii_alphanumeric() && c != ' ');
-        k.key == self.key
-            && k.mods.ctrl == self.ctrl
-            && k.mods.alt == self.alt
-            && !k.mods.logo
-            && (symbol || k.mods.shift == self.shift)
+        let (logo, ctrl) = if cfg!(target_os = "macos") { (self.command, self.ctrl) } else { (false, self.ctrl || self.command) };
+        k.key == self.key && k.mods.logo == logo && k.mods.ctrl == ctrl && k.mods.alt == self.alt && (symbol || k.mods.shift == self.shift)
     }
 }
 
@@ -198,9 +202,18 @@ const B: Option<Pane> = Some(Pane::Branches);
 /// global ones.
 pub const BINDINGS: &[Binding] = &[
     // Files.
-    b(F, &["<space>"], Cmd::ToggleStaged, "Stage / unstage file", "stage"),
+    // Files. The lists are folder trees: on a folder, h / l close and open it (or go up to
+    // the folder it's in, or into it); where there's no folder to do that with they move to
+    // the next pane, as everywhere.
+    b(F, &["<space>"], Cmd::ToggleStaged, "Stage / unstage (a folder: all its files)", "stage"),
     b(F, &["a"], Cmd::ToggleAll, "Stage / unstage all", "all"),
-    b(F, &["<enter>"], Cmd::Enter, "Stage lines and hunks", "lines"),
+    b(F, &["<enter>"], Cmd::ToggleFolder, "Open / close folder", "open / close"),
+    b(F, &["<enter>"], Cmd::Resolve, "Resolve the conflict", "resolve"),
+    b(F, &["<enter>"], Cmd::Enter, "Into the diff (stage lines and hunks there)", "diff"),
+    b(F, &["h", "<left>"], Cmd::FolderLeft, "Close folder, or go up to the one it's in", "folders"),
+    b(F, &["l", "<right>"], Cmd::FolderRight, "Open folder, or go into it", "folders"),
+    b(F, &["h", "<left>"], Cmd::PaneLeft, "", ""),
+    b(F, &["l", "<right>"], Cmd::PaneRight, "", ""),
     b(F, &["d"], Cmd::DiscardMenu, "Discard…", "discard"),
     b(F, &["D"], Cmd::ResetMenu, "Reset options…", ""),
     b(F, &["A"], Cmd::Amend, "Amend last commit with staged changes", "amend"),
@@ -217,7 +230,12 @@ pub const BINDINGS: &[Binding] = &[
     b(Some(Pane::Stash), &["d"], Cmd::Drop, "Drop stash…", "drop"),
     b(Some(Pane::Stash), &["n"], Cmd::NewBranch, "New branch from stash", "branch"),
     b(Some(Pane::Stash), &["r"], Cmd::Rename, "Rename stash", "rename"),
+    b(Some(Pane::Stash), &["<enter>"], Cmd::ToggleFolder, "Open / close folder", "open / close"),
     b(Some(Pane::Stash), &["<enter>"], Cmd::Enter, "Into its diff", "diff"),
+    b(Some(Pane::Stash), &["h", "<left>"], Cmd::FolderLeft, "Close folder, or go up to the one it's in", "folders"),
+    b(Some(Pane::Stash), &["l", "<right>"], Cmd::FolderRight, "Open folder, or go into it", "folders"),
+    b(Some(Pane::Stash), &["h", "<left>"], Cmd::PaneLeft, "", ""),
+    b(Some(Pane::Stash), &["l", "<right>"], Cmd::PaneRight, "", ""),
     b(Some(Pane::Stash), &["<esc>"], Cmd::Back, "Close the stash", "close"),
     // The diff: select lines (like clicking them), then stage or discard them.
     b(M, &["h", "<left>"], Cmd::PrevHunk, "Previous hunk", "hunks"),
@@ -308,49 +326,12 @@ pub const BINDINGS: &[Binding] = &[
     b(None, &["?"], Cmd::Help, "", ""),
 ];
 
-/// The command for a key press in a pane: the pane's own bindings first, then global ones.
-pub fn lookup(pane: Pane, k: &KeyPress) -> Option<Cmd> {
-    let hit = |p: Option<Pane>| BINDINGS.iter().find(|b| b.pane == p && b.keys.iter().any(|s| Chord::parse(s).matches(k)));
-    hit(Some(pane)).or_else(|| hit(None)).map(|b| b.cmd)
-}
-
-/// The `?` menu for a pane: (keys, what they do, command), the pane's own first. Keys a pane
-/// takes over don't show up again from the global list.
-pub fn help(pane: Pane) -> Vec<(&'static [&'static str], &'static str, Cmd)> {
-    let own: Vec<&Binding> = BINDINGS.iter().filter(|b| b.pane == Some(pane)).collect();
-    let taken = |key: &str| own.iter().any(|b| b.keys.contains(&key));
-    own.iter()
-        .copied()
-        .chain(BINDINGS.iter().filter(|b| b.pane.is_none() && !b.keys.iter().all(|k| taken(k))))
-        .filter(|b| !b.help.is_empty())
-        .map(|b| (b.keys, b.help, b.cmd))
-        .collect()
-}
-
-/// One entry of the key bar.
-pub struct BarEntry {
-    pub keys: String,
-    pub label: &'static str,
-    /// What the (first) key runs.
-    pub cmd: Cmd,
-    /// A single key: clicking the entry runs it.
-    pub single: bool,
-}
-
-/// The key bar for a pane: its own labelled keys first, then the global ones it doesn't take
-/// over. Neighbours with the same label share an entry ("h l  hunks", "1–4  panes").
-pub fn bar(pane: Pane) -> Vec<BarEntry> {
-    let own: Vec<&Binding> = BINDINGS.iter().filter(|b| b.pane == Some(pane)).collect();
-    let taken = |key: &str| own.iter().any(|b| b.keys.contains(&key));
-    let global = BINDINGS.iter().filter(|b| b.pane.is_none() && !b.keys.iter().all(|k| taken(k)));
-    let mut out: Vec<(Vec<&str>, &str, Cmd)> = Vec::new();
-    for b in own.iter().copied().chain(global).filter(|b| !b.bar.is_empty()) {
-        match out.last_mut() {
-            Some(last) if last.1 == b.bar => last.0.push(b.keys[0]),
-            _ => out.push((vec![b.keys[0]], b.bar, b.cmd)),
-        }
-    }
-    out.into_iter().map(|(keys, label, cmd)| BarEntry { keys: show_keys(&keys), label, cmd, single: keys.len() == 1 }).collect()
+/// What a pane offers, in order: its own bindings, then the global ones it doesn't take over
+/// (`Ui::key` gives a key to the first binding offered that has it).
+pub fn offers(pane: Pane) -> impl Iterator<Item = &'static Binding> {
+    let taken = move |key: &str| BINDINGS.iter().any(|b| b.pane == Some(pane) && b.keys.contains(&key));
+    let own = BINDINGS.iter().filter(move |b| b.pane == Some(pane));
+    own.chain(BINDINGS.iter().filter(move |b| b.pane.is_none() && !b.keys.iter().all(|k| taken(k))))
 }
 
 /// A key the way the bar and menus show it: "space", "ctrl-j", "shift-↓", "⌥↑".
@@ -358,8 +339,8 @@ pub fn pretty(key: &str) -> String {
     let Some(inner) = key.strip_prefix('<').and_then(|k| k.strip_suffix('>')).filter(|_| key.len() > 2) else {
         return key.to_string();
     };
-    let (mods, name) = match inner.split_once('-') {
-        Some((m, n)) if m.len() == 1 && !n.is_empty() => (m, n),
+    let (mods, name) = match inner.rsplit_once('-') {
+        Some((m, n)) if !n.is_empty() && m.split('-').all(|m| ["c", "s", "a", "m"].contains(&m)) => (m, n),
         _ => ("", inner),
     };
     let name = match name {
@@ -370,16 +351,22 @@ pub fn pretty(key: &str) -> String {
         "pgdown" => "pgdn",
         n => n,
     };
-    match mods {
-        "c" => format!("ctrl-{name}"),
-        "s" => format!("shift-{name}"),
-        "a" => format!("⌥{name}"),
-        _ => name.to_string(),
+    let mut out = String::new();
+    for m in mods.split('-').filter(|m| !m.is_empty()) {
+        out.push_str(match m {
+            "m" if cfg!(target_os = "macos") => "⌘",
+            "m" | "c" => "ctrl-",
+            "s" => "shift-",
+            "a" => "⌥",
+            _ => "",
+        });
     }
+    let name = if out.ends_with('⌘') && name.chars().count() == 1 { name.to_uppercase() } else { name.to_string() };
+    out + &name
 }
 
 /// Several keys for one entry; a run of digits reads as a range.
-fn show_keys(keys: &[&str]) -> String {
+pub fn show_keys(keys: &[&str]) -> String {
     let digits = keys.len() > 2 && keys.iter().all(|k| k.len() == 1 && k.as_bytes()[0].is_ascii_digit());
     match digits {
         true => format!("{}–{}", keys[0], keys[keys.len() - 1]),
@@ -390,7 +377,8 @@ fn show_keys(keys: &[&str]) -> String {
 /// A key press as lazygit writes it (tests and `--keys` screenshots drive the app with these).
 pub fn press(s: &str) -> KeyPress {
     let c = Chord::parse(s);
-    KeyPress { key: c.key, mods: crate::ui::Mods { shift: c.shift, ctrl: c.ctrl, alt: c.alt, logo: false } }
+    let (logo, ctrl) = if cfg!(target_os = "macos") { (c.command, c.ctrl) } else { (false, c.ctrl || c.command) };
+    KeyPress { key: c.key, mods: crate::ui::Mods { shift: c.shift, ctrl, alt: c.alt, logo } }
 }
 
 #[cfg(test)]
@@ -422,33 +410,29 @@ mod tests {
     }
 
     #[test]
-    fn panes_override_global_keys() {
-        let h = press(Key::Char('h'), false, false);
-        assert_eq!(lookup(Pane::Main, &h), Some(Cmd::PrevHunk));
-        assert_eq!(lookup(Pane::Commits, &h), Some(Cmd::PaneLeft));
-        let f = press(Key::Char('f'), false, false);
-        assert_eq!((lookup(Pane::Files, &f), lookup(Pane::Commits, &f), lookup(Pane::Branches, &f)), (Some(Cmd::Fetch), Some(Cmd::Fixup), Some(Cmd::FastForward)));
-        let r = press(Key::Char('r'), true, false);
-        assert_eq!((lookup(Pane::Branches, &r), lookup(Pane::Commits, &r)), (Some(Cmd::Rename), Some(Cmd::Refresh)));
-        // The help lists a pane's own keys first, without global ones it shadows.
-        let h = help(Pane::Main);
-        assert_eq!(h[0].1, "Previous hunk");
-        assert!(!help(Pane::Branches).iter().any(|(_, _, c)| *c == Cmd::Refresh), "R renames there");
+    fn panes_offer_their_own_keys_before_global_ones() {
+        let offered = |pane: Pane, key: &str| offers(pane).find(|b| b.keys.contains(&key)).map(|b| b.cmd);
+        assert_eq!(offered(Pane::Main, "h"), Some(Cmd::PrevHunk));
+        assert_eq!(offered(Pane::Commits, "h"), Some(Cmd::PaneLeft));
+        // In the file trees h / l are for folders first, then move between panes.
+        let all = |pane: Pane, key: &str| offers(pane).filter(|b| b.keys.contains(&key)).map(|b| b.cmd).collect::<Vec<_>>();
+        assert_eq!(all(Pane::Files, "l"), [Cmd::FolderRight, Cmd::PaneRight]);
+        assert_eq!(all(Pane::Stash, "<left>"), [Cmd::FolderLeft, Cmd::PaneLeft]);
+        assert_eq!((offered(Pane::Files, "f"), offered(Pane::Commits, "f"), offered(Pane::Branches, "f")), (Some(Cmd::Fetch), Some(Cmd::Fixup), Some(Cmd::FastForward)));
+        // A global binding a pane takes over entirely isn't offered there at all.
+        assert!(!offers(Pane::Branches).any(|b| b.cmd == Cmd::Refresh), "R renames there");
+        assert!(offers(Pane::Commits).any(|b| b.cmd == Cmd::Refresh));
     }
 
     #[test]
-    fn key_bar_lists_a_panes_keys_then_global_ones() {
-        let files = bar(Pane::Files);
-        assert_eq!((files[0].keys.as_str(), files[0].label, files[0].cmd, files[0].single), ("space", "stage", Cmd::ToggleStaged, true));
-        let labels: Vec<&str> = files.iter().map(|e| e.label).collect();
-        assert!(labels.iter().position(|l| *l == "stash") < labels.iter().position(|l| *l == "push"), "own keys first: {labels:?}");
-        // Neighbours with one label share an entry (and clicking it runs nothing).
-        let diff = bar(Pane::Main);
-        assert_eq!((diff[0].keys.as_str(), diff[0].label, diff[0].single), ("h l", "hunks", false));
-        assert!(files.iter().any(|e| e.keys == "1–4" && e.label == "panes"));
-        assert!(bar(Pane::Commits).iter().any(|e| e.keys == "ctrl-j ctrl-k" && e.label == "move"));
-        // A pane's own key hides the global one it shadows (c: by name in the branch list).
-        assert!(!bar(Pane::Branches).iter().any(|e| e.label == "commit"));
-        assert_eq!((pretty("<s-down>"), pretty("<a-up>"), pretty("<c-R>"), pretty("J")), ("shift-↓".into(), "⌥↑".into(), "ctrl-R".into(), "J".into()));
+    fn command_chords_and_how_keys_read() {
+        let cmd_k = super::press("<m-k>");
+        assert!(Chord::parse("<m-k>").matches(&cmd_k) && !Chord::parse("k").matches(&cmd_k));
+        let ctrl_shift_tab = super::press("<c-s-tab>");
+        assert!(Chord::parse("<c-s-tab>").matches(&ctrl_shift_tab) && !Chord::parse("<c-tab>").matches(&ctrl_shift_tab));
+        let mac = cfg!(target_os = "macos");
+        assert_eq!(pretty("<m-k>"), if mac { "⌘K" } else { "ctrl-k" });
+        assert_eq!(pretty("<m-enter>"), if mac { "⌘enter" } else { "ctrl-enter" });
+        assert_eq!((pretty("<s-down>"), pretty("<a-up>"), pretty("<c-R>"), pretty("<c-s-tab>"), pretty("J")), ("shift-↓".into(), "⌥↑".into(), "ctrl-R".into(), "ctrl-shift-tab".into(), "J".into()));
     }
 }
