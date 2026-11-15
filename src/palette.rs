@@ -59,8 +59,9 @@ pub enum Act {
     SetUpstream { branch: String, upstream: Option<String> },
     /// Ask for a tag name (and optional message), then tag this commit.
     PromptTagAt(String),
-    /// `git tag` (annotated with a message), then optionally push it to a remote.
-    CreateTag { name: String, at: String, message: Option<String>, push: Option<String> },
+    /// `git tag` (annotated with a message), then optionally push it to a remote, and with it
+    /// the checked-out branch if so (see `Palette::tag_push`).
+    CreateTag { name: String, at: String, message: Option<String>, push: Option<(String, bool)> },
     /// Push one tag, or all of them (None), to a remote.
     PushTag { tag: Option<String>, remote: String },
     DeleteTag(String),
@@ -174,6 +175,9 @@ pub struct Palette {
     pub worktree_from: Option<WtFrom>,
     /// When set, the palette is asking for a tag name (and message) for this commit.
     pub tag_at: Option<String>,
+    /// Where that tag can be pushed: a remote, and whether the checked-out branch goes along
+    /// (the commit is on it, but on none of the remote's branches yet).
+    pub tag_push: Option<(String, bool)>,
     /// When set, the palette is asking which remote branch this local branch should track.
     pub upstream_for: Option<String>,
     /// When set, the palette is asking for this commit's new message.
@@ -198,6 +202,7 @@ impl Palette {
         self.branch_at = None;
         self.worktree_from = None;
         self.tag_at = None;
+        self.tag_push = None;
         self.upstream_for = None;
         self.reword_of = None;
         self.rename_of = None;

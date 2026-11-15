@@ -1637,9 +1637,11 @@ impl GitApp {
                 self.reload_all(false);
             }
             Act::PromptTagAt(h) => {
+                let push = self.tag_push_target(&h);
                 self.focus = Focus::Palette;
                 self.palette.reset("");
                 self.palette.tag_at = Some(h);
+                self.palette.tag_push = push;
             }
             Act::CreateTag { name, at, message, push } => {
                 let mut args = vec!["tag"];
@@ -1650,8 +1652,19 @@ impl GitApp {
                 let r = repo.git(&args);
                 if self.result(r, "") {
                     self.push_undo(Undo::Cmd { args: own(&["tag", "-d", &name]), label: format!("create tag {name}") });
-                    if let Some(remote) = push {
-                        self.act(Act::PushTag { tag: Some(name), remote });
+                    match push {
+                        // One push, so the tag never points at commits no remote branch has. The
+                        // branch goes as Push sends it: to its own name, tracked if it isn't yet.
+                        Some((remote, true)) => {
+                            let mut args = own(&["push"]);
+                            if self.repo.as_ref().is_some_and(|r| r.upstream().is_none()) {
+                                args.push("-u".into());
+                            }
+                            args.extend([remote.clone(), self.head_name.clone(), format!("refs/tags/{name}")]);
+                            self.spawn(&format!("Pushing {} and tag {name} to {remote}", self.head_name), args);
+                        }
+                        Some((remote, false)) => self.act(Act::PushTag { tag: Some(name), remote }),
+                        None => {}
                     }
                 }
                 self.reload_all(false);
@@ -4713,13 +4726,31 @@ impl GitApp {
             Some(m) => format!("annotated · {m}"),
             None => "lightweight · add a message to annotate it".into(),
         };
-        let create = |push: Option<String>| Act::CreateTag { name: name.to_string(), at: at.to_string(), message: message.clone(), push };
+        let create = |push| Act::CreateTag { name: name.to_string(), at: at.to_string(), message: message.clone(), push };
         let mut items = vec![Item { label: format!("Create tag '{name}' at {short}"), detail: detail.clone(), act: create(None), score: 1, kind: "tag" }];
-        if let Some((remote, _)) = self.remotes_upstream_first().0.into_iter().next() {
-            let label = format!("Create tag '{name}' at {short} and push it to {remote}");
-            items.push(Item { label, detail, act: create(Some(remote)), score: 0, kind: "tag" });
+        if let Some((remote, with)) = self.palette.tag_push.clone() {
+            let label = if with {
+                format!("Create tag '{name}' at {short} and push it with {} to {remote}", self.head_name)
+            } else {
+                format!("Create tag '{name}' at {short} and push it to {remote}")
+            };
+            items.push(Item { label, detail, act: create(Some((remote, with))), score: 0, kind: "tag" });
         }
         items
+    }
+
+    /// Where a new tag at `at` is pushed: the upstream's remote (else the first one), and whether
+    /// the checked-out branch goes along: when the commit is on it but on none of the remote's
+    /// branches yet, so the tag doesn't point at commits no remote branch has.
+    fn tag_push_target(&self, at: &str) -> Option<(String, bool)> {
+        let repo = self.repo.as_ref()?;
+        let (remote, _) = self.remotes_upstream_first().0.into_iter().next()?;
+        let published = || {
+            let mine = format!("refs/remotes/{remote}/");
+            repo.git(&["for-each-ref", "--count=1", "--format=%(refname)", "--contains", at, &mine]).is_ok_and(|s| !s.trim().is_empty())
+        };
+        let with = self.local_names.contains(&self.head_name) && repo.is_ancestor(at, "HEAD") && !published();
+        Some((remote, with))
     }
 
     /// The upstream picker: every remote branch (ones with the same name first), and stopping
@@ -6354,11 +6385,12 @@ mod tests {
         let head = git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
         let labels = |h: &Harness| h.app.palette.items.iter().map(|i| i.label.clone()).collect::<Vec<_>>();
 
-        // Just a name: a lightweight tag, here or here and on origin.
+        // Just a name: a lightweight tag, here or here and on origin (with main, which origin
+        // doesn't have yet).
         h.app.act(Act::PromptTagAt(head.clone()));
         h.type_text("v1");
         let short = &head[..8];
-        assert_eq!(labels(&h), [format!("Create tag 'v1' at {short}"), format!("Create tag 'v1' at {short} and push it to origin")]);
+        assert_eq!(labels(&h), [format!("Create tag 'v1' at {short}"), format!("Create tag 'v1' at {short} and push it with main to origin")]);
         assert!(h.app.palette.items[0].detail.starts_with("lightweight"));
         h.key(Key::Enter);
         assert_eq!(git(&["cat-file", "-t", "v1"]).unwrap().trim(), "commit");
@@ -6374,6 +6406,8 @@ mod tests {
         h.key(Key::Enter);
         h.wait_job();
         assert_eq!(remote_has("v2").unwrap(), "tag");
+        // main went along, as a first push does: tracked from now on.
+        assert_eq!(git(&["rev-parse", "--abbrev-ref", "main@{u}"]).unwrap().trim(), "origin/main");
         // Taken names and names git refuses get nothing to click.
         for (name, n) in [("v2", 1), ("-x", 0), ("a..b", 0), ("x.lock", 0)] {
             h.app.act(Act::PromptTagAt(head.clone()));
@@ -6399,6 +6433,55 @@ mod tests {
         h.click_menu_item("Push all tags to origin");
         h.wait_job();
         assert_eq!(remote_has("v3").unwrap(), "commit");
+        for d in [&dir, &up] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn pushing_a_new_tag_takes_the_branch_along_when_origin_lacks_the_commit() {
+        // main tracks origin/main and is one commit (three) ahead of it.
+        let dir = temp_repo("tagpush");
+        let up = dir.with_file_name(format!("{}-up.git", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&up);
+        let git = |args: &[&str]| git::run(&dir, args, None).unwrap().trim().to_string();
+        git(&["init", "-q", "--bare", up.to_str().unwrap()]);
+        git(&["remote", "add", "origin", up.to_str().unwrap()]);
+        git(&["push", "-q", "-u", "origin", "main"]);
+        std::fs::write(dir.join("three"), "3").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "three"]);
+        let (head, pushed) = (git(&["rev-parse", "HEAD"]), git(&["rev-parse", "HEAD~1"]));
+        let on_origin = |rev: &str| git::run(&up, &["rev-parse", rev], None).unwrap().trim().to_string();
+        let mut h = Harness::new(&dir);
+        // Names a tag at `at` and picks "…and push it…", returning that item's label.
+        let tag_and_push = |h: &mut Harness, at: &str, name: &str| {
+            h.app.act(Act::PromptTagAt(at.to_string()));
+            h.type_text(name);
+            let label = h.app.palette.items[1].label.clone();
+            h.key(Key::Down);
+            h.key(Key::Enter);
+            h.wait_job();
+            label
+        };
+
+        // A commit origin already has: just the tag.
+        assert_eq!(tag_and_push(&mut h, &pushed, "v1"), format!("Create tag 'v1' at {} and push it to origin", &pushed[..8]));
+        assert_eq!((on_origin("v1"), on_origin("main")), (pushed.clone(), pushed.clone()));
+
+        // The new commit: main goes with it, so origin has it on main, not only under the tag.
+        assert_eq!(tag_and_push(&mut h, &head, "v2"), format!("Create tag 'v2' at {} and push it with main to origin", &head[..8]));
+        assert_eq!((on_origin("v2"), on_origin("main")), (head.clone(), head.clone()));
+        assert_eq!(git(&["rev-parse", "origin/main"]), head);
+
+        // A branch made from origin/main, tagged where origin has it (under another name): just
+        // the tag, no copy of the branch.
+        git(&["checkout", "-qb", "fix", "origin/main"]);
+        h.app.reload_all(true);
+        h.app.finish_loading();
+        assert_eq!(tag_and_push(&mut h, &head, "v3"), format!("Create tag 'v3' at {} and push it to origin", &head[..8]));
+        assert_eq!(on_origin("v3"), head);
+        assert!(git::run(&up, &["rev-parse", "-q", "--verify", "refs/heads/fix"], None).is_err());
         for d in [&dir, &up] {
             let _ = std::fs::remove_dir_all(d);
         }
