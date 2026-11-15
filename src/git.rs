@@ -556,10 +556,12 @@ impl Repo {
         Ok(parse_diff(&self.git(&args)?))
     }
 
-    /// Hashes reachable from `b` but not from `a` (newest first, capped).
-    pub fn range_hashes(&self, a: &str, b: &str, limit: usize) -> Vec<String> {
+    /// The commits only one of `a` and `b` has (`a...b`, newest first, capped), each with whether
+    /// it's `b`'s.
+    pub fn diverged(&self, a: &str, b: &str, limit: usize) -> Vec<(String, bool)> {
         let n = limit.to_string();
-        self.git(&["rev-list", "-n", &n, &format!("{a}..{b}")]).unwrap_or_default().lines().map(String::from).collect()
+        let out = self.git(&["rev-list", "--left-right", "-n", &n, &format!("{a}...{b}")]).unwrap_or_default();
+        out.lines().filter_map(|l| Some((l.get(1..)?.to_string(), l.starts_with('>')))).collect()
     }
 
     pub fn count_range(&self, a: &str, b: &str) -> usize {

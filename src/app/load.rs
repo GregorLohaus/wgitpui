@@ -257,7 +257,8 @@ impl GitApp {
             self.marks.clear();
             self.chain = None;
             self.owners.clear();
-            self.lineage = None;
+            self.lineages.clear();
+            self.lineage_key = None;
             self.log_rx = Some(r.log);
             self.loading = true;
             self.take_log(r.first.into_iter().collect());

@@ -83,8 +83,18 @@ struct Compare {
     merge_base: bool,
     ahead: usize,
     behind: usize,
-    range: HashSet<usize>,
+    /// The commits between the two: those only one side has, each with whether it's B's (B is
+    /// ahead by those) or A's (B is behind by those). Capped, like the counts' list.
+    sides: HashMap<String, bool>,
 }
+
+/// A's color (cyan) or B's (purple), as on the comparison's chips and the graph's badges.
+fn side_color(b: bool) -> Color {
+    if b { theme::PURPLE } else { theme::CYAN }
+}
+
+/// How many of the commits between two compared ones are looked at.
+const BETWEEN_CAP: usize = 20_000;
 
 struct MenuItem {
     label: String,
@@ -253,8 +263,9 @@ struct GDrag {
 /// commit on main's line counts as main's even where a feature branch's first parents run along it.
 const TRUNKS: [&str; 6] = ["main", "master", "trunk", "develop", "development", "dev"];
 
-/// The selected branch's history, picked out in the graph and the minimap: its first-parent line
-/// in one color with a glow, and the merges that took its commits into other branches.
+/// A branch's history, picked out in the graph and the minimap: its first-parent line in one
+/// color with a glow, and the merges that took its commits into other branches. A comparison
+/// picks out both sides' branches, and only the merges from one into the other.
 struct Lineage {
     /// The row the line starts at (the branch tip).
     tip: usize,
@@ -264,7 +275,11 @@ struct Lineage {
     /// `chain[..own]` are the branch's own commits: those before it joins a trunk's line (for a
     /// trunk, those before it joins a different one).
     own: usize,
-    /// (merge row, merged parent row) for each merge that took an own commit into another line.
+    /// The chain stops where it runs into another picked-out line, which carries on from that
+    /// row (the last in `chain`) in its own color.
+    joins: bool,
+    /// (merge row, merged parent row) for each merge that took an own commit into another line;
+    /// in a comparison, into the other side's own commits.
     merges: Vec<(u32, u32)>,
 }
 
@@ -300,7 +315,10 @@ pub struct GitApp {
     owners_at: Instant,
     /// Tip rows of trunk branches, with the trunk's rank (`trunk_rank`).
     trunks: Vec<(u32, usize)>,
-    lineage: Option<Lineage>,
+    /// The selected branch's line, or in a comparison both sides' (the one drawn on top first),
+    /// and the tips (and whether for a comparison) they were worked out for.
+    lineages: Vec<Lineage>,
+    lineage_key: Option<(Vec<usize>, bool)>,
     /// The remote's default branch, looked up only when no branch has a name from `TRUNKS`.
     default_branch: Option<String>,
     // Working copy.
@@ -426,7 +444,8 @@ impl GitApp {
             owners: vec![],
             owners_at: Instant::now(),
             trunks: vec![],
-            lineage: None,
+            lineages: vec![],
+            lineage_key: None,
             default_branch: None,
             changes: vec![],
             worktrees: vec![],
@@ -1189,7 +1208,7 @@ impl GitApp {
         if a == b {
             return;
         }
-        self.compare = Some(Compare { a, b, merge_base, ahead: 0, behind: 0, range: HashSet::new() });
+        self.compare = Some(Compare { a, b, merge_base, ahead: 0, behind: 0, sides: HashMap::new() });
         self.file_view = None;
         self.load_compare();
     }
@@ -1223,9 +1242,13 @@ impl GitApp {
             Err(e) => DiffView::new(vec![], DiffMode::Commit, key).note(e),
         };
         let (ra, rb) = (a.unwrap_or("HEAD"), b.unwrap_or("HEAD"));
-        c.ahead = repo.count_range(ra, rb);
-        c.behind = repo.count_range(rb, ra);
-        c.range = repo.range_hashes(ra, rb, 20_000).iter().filter_map(|h| self.hash_index.get(h).copied()).collect();
+        c.sides = repo.diverged(ra, rb, BETWEEN_CAP).into_iter().collect();
+        (c.ahead, c.behind) = if c.sides.len() < BETWEEN_CAP {
+            let ahead = c.sides.values().filter(|&&b| b).count();
+            (ahead, c.sides.len() - ahead)
+        } else {
+            (repo.count_range(ra, rb), repo.count_range(rb, ra))
+        };
         self.set_diff(view);
     }
 
@@ -2883,20 +2906,30 @@ impl GitApp {
         TRUNKS.iter().position(|t| *t == short).map(|i| i + 1)
     }
 
-    /// The selected branch: the working copy means HEAD's; a commit some branch points at means
-    /// that branch; any other commit means the line it sits on.
-    fn lineage_tip(&self) -> Option<usize> {
-        match self.sel {
-            Sel::Wip => self.head_row,
-            Sel::Commit(_) => {
-                let i = self.sel_row()?;
-                let labeled = self.commits[i].refs.iter().any(|d| d != "HEAD" && !d.starts_with("tag: ") && !self.deco_hidden(d));
-                Some(if labeled { i } else { *self.owners.get(i)? as usize })
-            }
-        }
+    /// The branch a commit means: one pointing at it, or else the line it sits on.
+    fn branch_tip(&self, row: usize) -> Option<usize> {
+        let labeled = self.commits.get(row)?.refs.iter().any(|d| d != "HEAD" && !d.starts_with("tag: ") && !self.deco_hidden(d));
+        if labeled { Some(row) } else { self.owners.get(row).map(|&o| o as usize) }
     }
 
-    /// Keeps `lineage` in step with the selection and the loaded history.
+    /// The branches picked out in the graph: the selected one (the working copy means HEAD's),
+    /// or in a comparison both sides' (A's first).
+    fn lineage_tips(&self) -> Vec<usize> {
+        let tip = |rev: Option<&String>| match rev {
+            None => self.head_row,
+            Some(h) => self.branch_tip(*self.hash_index.get(h)?),
+        };
+        let mut tips: Vec<usize> = match (&self.compare, self.sel) {
+            (Some(c), _) => [&c.a, &c.b].into_iter().filter_map(|e| tip(e.rev.as_ref())).collect(),
+            (None, Sel::Wip) => self.head_row.into_iter().collect(),
+            (None, Sel::Commit(_)) => self.sel_row().and_then(|i| self.branch_tip(i)).into_iter().collect(),
+        };
+        tips.retain(|&t| t < self.graph.rows.len());
+        tips.dedup();
+        tips
+    }
+
+    /// Keeps `lineages` in step with the selection, the comparison and the loaded history.
     fn update_lineage(&mut self) {
         // While history streams in, rows are only appended and what is worked out stays valid,
         // so catching up now and then is enough (a full pass per batch adds up on huge histories).
@@ -2906,15 +2939,62 @@ impl GitApp {
             self.owners = self.graph.owners(&tips);
             self.owners_at = Instant::now();
             self.trunks = trunks;
-            self.lineage = None;
+            self.lineage_key = None;
         }
-        let Some(tip) = self.lineage_tip().filter(|&t| t < self.graph.rows.len()) else {
-            self.lineage = None;
+        let key = (self.lineage_tips(), self.compare.is_some());
+        if self.lineage_key.as_ref() == Some(&key) {
             return;
+        }
+        let mut lines: Vec<Lineage> = key.0.iter().map(|&t| self.lineage(t, !key.1)).collect();
+        if let [a, b] = &mut lines[..] {
+            // Compared commits on two branches: A's in A's color, B's in B's.
+            (a.color, b.color) = (side_color(false), side_color(true));
+        }
+        // Two lines that meet are one line from there down. It's drawn once, as the branch it
+        // belongs to (the line of the commit they meet at, else one starting there, else A's);
+        // the other stops where it runs into it.
+        let meet = match &lines[..] {
+            [a, b] => b.chain.iter().copied().find(|&r| a.has(r as usize)).map(|m| {
+                let line = self.owners.get(m as usize).map(|&o| o as usize);
+                (m, line == Some(b.tip) || (line != Some(a.tip) && b.tip == m as usize))
+            }),
+            _ => None,
         };
-        if self.lineage.as_ref().is_some_and(|l| l.tip == tip) {
-            return;
+        if let Some((m, b_on_top)) = meet {
+            if b_on_top {
+                lines.swap(0, 1);
+            }
+            let l = &mut lines[1];
+            match l.chain.binary_search(&m) {
+                Ok(k) if k > 0 => {
+                    l.chain.truncate(k + 1);
+                    l.own = l.own.min(k);
+                    l.joins = true;
+                }
+                // It's all the other's line.
+                _ => drop(lines.pop()),
+            }
         }
+        // Compared branches: only the merges between the two, where one's own commits were
+        // merged into the other's (none when both commits are on one line).
+        if let [a, b] = &lines[..] {
+            let into = |from: &Lineage, to: &Lineage| -> Vec<(u32, u32)> {
+                let to = &to.chain[..to.own];
+                let out = self.graph.merged_into(&from.chain, &from.chain[..from.own]);
+                out.into_iter().filter(|m| to.binary_search(&m.0).is_ok()).collect()
+            };
+            let merges = [into(a, b), into(b, a)];
+            for (l, m) in lines.iter_mut().zip(merges) {
+                l.merges = m;
+            }
+        }
+        self.lineages = lines;
+        self.lineage_key = Some(key);
+    }
+
+    /// The line from `tip`: its first-parent history, how much of that is the branch's own, and
+    /// (with `merges`) where its own commits were merged into other branches.
+    fn lineage(&self, tip: usize, merges: bool) -> Lineage {
         let chain = self.graph.first_parent_chain(tip);
         // The branch's own commits run until its line joins a trunk's (for a trunk: another
         // trunk's; with no trunk known: any other line). Rows not worked out yet end it too.
@@ -2928,17 +3008,29 @@ impl GitApp {
             None => trunk_of(o).is_none(),
         };
         let own = chain.iter().take_while(|&&r| line(r).is_some_and(&mine)).count().max(1);
-        let merges = self.graph.merged_into(&chain, &chain[..own]);
+        let merges = if merges { self.graph.merged_into(&chain, &chain[..own]) } else { vec![] };
         let color = theme::lane(self.graph.rows[tip].color as usize);
-        self.lineage = Some(Lineage { tip, color, chain, own, merges });
+        Lineage { tip, color, chain, own, joins: false, merges }
+    }
+
+    /// The color a merge is picked out in, if it is: one that took the selected branch into
+    /// another (in a comparison: one compared branch into the other), in the color of the branch
+    /// it merged in.
+    fn merge_mark(&self, row: usize) -> Option<Color> {
+        self.lineages.iter().find(|l| l.merge_at(row)).map(|l| l.color)
+    }
+
+    /// The color of the picked-out line `row` is on, if any.
+    fn lineage_color(&self, row: usize) -> Option<Color> {
+        self.lineages.iter().find(|l| l.has(row)).map(|l| l.color)
     }
 
     fn lane_x(r: &Rect, lane: u16) -> f32 {
         r.x + 16.0 + lane as f32 * LANE_W
     }
 
-    /// The selected branch's history over the muted graph: its first-parent line in one color
-    /// with a soft glow, plus the edges into the merges that took it into other branches.
+    /// A picked-out branch over the muted graph: its first-parent line in one color with a soft
+    /// glow, plus the edges into the merges that took it into other branches.
     fn draw_lineage(ui: &mut Ui, g: &Graph, l: &Lineage, list: &Rect, off: f32, first: usize, last: usize) {
         let cy = |row: u32| list.y + (row as f32 + 1.5) * ROW_H - off;
         let x = |row: u32| Self::lane_x(list, g.rows[row as usize].lane);
@@ -2959,10 +3051,11 @@ impl GitApp {
         let hi = ch.partition_point(|&r| (r as usize) < last).min(ch.len().saturating_sub(1));
         let open = (-1e9, 1e9);
         // The glow is translucent, so each edge keeps to its own rows: neighbours meet at a node
-        // without doubling up. The two ends stay open so the tip and root get round caps.
+        // without doubling up. The two ends stay open so the tip and root get round caps (not
+        // where the line runs into another one, which glows on from there).
         for k in lo..hi {
             let y0 = if k == 0 { open.0 } else { cy(ch[k]) };
-            let y1 = if k + 2 == ch.len() { open.1 } else { cy(ch[k + 1]) };
+            let y1 = if k + 2 == ch.len() && !l.joins { open.1 } else { cy(ch[k + 1]) };
             edge(ui, ch[k], ch[k + 1], (y0, y1), 2.4, 6.0, l.color.alpha(0.32));
         }
         for &(m, p) in &l.merges {
@@ -3001,9 +3094,10 @@ impl GitApp {
                 Sel::Commit(_) => sel_row.is_some_and(|c| i == c + 1),
             };
             let hov = ui.hovered(row) && self.drag == Drag::None && !dragging;
-            if let Some(l) = self.lineage.as_ref().filter(|l| i > 0 && l.merge_at(i - 1)) {
-                // A merge that took the selected branch into another one.
-                ui.p.rect(row, l.color.alpha(0.08));
+            if let Some(c) = (i > 0).then(|| self.merge_mark(i - 1)).flatten() {
+                // A merge that took the selected branch into another one (or one compared branch
+                // into the other).
+                ui.p.rect(row, c.alpha(0.08));
             }
             if i > 0 && self.copied.contains(&self.commits[i - 1].hash) {
                 // Copied for cherry-picking (C), like lazygit's cyan.
@@ -3050,11 +3144,11 @@ impl GitApp {
                 y += 7.0;
             }
         }
-        // With a branch selected, everything off its line steps back.
-        let lin = self.lineage.as_ref();
+        // With a branch selected (or two compared), everything off their lines steps back.
+        let marked = !self.lineages.is_empty();
         let lane_color = |c: u16| {
             let c = theme::lane(c as usize);
-            if lin.is_some() { c.mix(theme::BG, MUTED) } else { c }
+            if marked { c.mix(theme::BG, MUTED) } else { c }
         };
         for i in first.saturating_sub(1).max(1)..last {
             let y = row_y(i) + ROW_H * 0.5;
@@ -3062,7 +3156,8 @@ impl GitApp {
                 ui.p.curve((Self::lane_x(&list, s.from), y), (Self::lane_x(&list, s.to), y + ROW_H), 1.8, lane_color(s.color));
             }
         }
-        if let Some(l) = lin {
+        // Last to first, so where two lines meet the first is on top.
+        for l in self.lineages.iter().rev() {
             Self::draw_lineage(ui, &self.graph, l, &list, off, first, last);
         }
         // Nodes.
@@ -3077,17 +3172,15 @@ impl GitApp {
             let c = &self.commits[i - 1];
             let g = &self.graph.rows[i - 1];
             let x = Self::lane_x(&list, g.lane);
-            let color = match lin {
-                Some(l) if l.has(i - 1) => l.color,
-                _ => lane_color(g.color),
-            };
-            if let Some(l) = lin.filter(|l| l.merge_at(i - 1)) {
-                // Where the selected branch was merged into another one: a glowing ring in its color.
-                ui.p.glow((x, cy), 5.0, 7.0, l.color.alpha(0.4));
+            let color = self.lineage_color(i - 1).unwrap_or_else(|| lane_color(g.color));
+            if let Some(mc) = self.merge_mark(i - 1) {
+                // Where the selected branch was merged into another one, or one compared branch
+                // into the other: a glowing ring in the color of the branch merged in.
+                ui.p.glow((x, cy), 5.0, 7.0, mc.alpha(0.4));
                 let r = if c.is_head() { 7.0 } else { 5.5 };
                 ui.p.circle((x, cy), r, theme::BG);
-                ui.p.ring((x, cy), r, 2.0, l.color);
-                ui.p.circle((x, cy), if c.is_head() { 3.0 } else { 2.0 }, l.color);
+                ui.p.ring((x, cy), r, 2.0, mc);
+                ui.p.circle((x, cy), if c.is_head() { 3.0 } else { 2.0 }, mc);
             } else if c.is_head() {
                 ui.p.circle((x, cy), 7.0, theme::BG);
                 ui.p.ring((x, cy), 7.0, 2.0, color);
@@ -3103,11 +3196,13 @@ impl GitApp {
 
         // Text columns.
         if let Some(c) = &self.compare {
-            // Commits in the compared range get a violet rail; endpoints get A / B badges.
+            // Commits between the compared ones get a rail in the color of the side that has
+            // them (B's: violet, A's: cyan); endpoints get A / B badges.
             for i in first.max(1)..last {
-                if c.range.contains(&(i - 1)) {
-                    ui.p.rect(Rect::new(list.x, row_y(i), list.w, ROW_H), theme::PURPLE.alpha(0.06));
-                    ui.p.rect(Rect::new(list.x, row_y(i), 3.0, ROW_H), theme::PURPLE.alpha(0.7));
+                if let Some(&b) = c.sides.get(&self.commits[i - 1].hash) {
+                    let color = side_color(b);
+                    ui.p.rect(Rect::new(list.x, row_y(i), list.w, ROW_H), color.alpha(0.06));
+                    ui.p.rect(Rect::new(list.x, row_y(i), 3.0, ROW_H), color.alpha(0.7));
                 }
             }
             for (end, letter, color) in [(&c.a, "A", theme::CYAN), (&c.b, "B", theme::PURPLE)] {
@@ -3157,10 +3252,7 @@ impl GitApp {
                 } else if let Some(t) = rf.strip_prefix("tag: ") {
                     (t, theme::YELLOW, theme::YELLOW, true)
                 } else if self.local_names.contains(rf.as_str()) {
-                    let lc = match &self.lineage {
-                        Some(l) if l.has(i - 1) => l.color,
-                        _ => theme::lane(self.graph.rows[i - 1].color as usize),
-                    };
+                    let lc = self.lineage_color(i - 1).unwrap_or_else(|| theme::lane(self.graph.rows[i - 1].color as usize));
                     (rf.as_str(), lc, lc.alpha(0.16), false)
                 } else {
                     (rf.as_str(), theme::CYAN.alpha(0.85), theme::CYAN, true)
@@ -3183,8 +3275,8 @@ impl GitApp {
                 }
                 x += pw + 6.0;
             }
-            // Merges read dimmer, except those that took the selected branch somewhere.
-            let merged_here = self.lineage.as_ref().is_some_and(|l| l.merge_at(i - 1));
+            // Merges read dimmer, except those picked out.
+            let merged_here = self.merge_mark(i - 1).is_some();
             let subject_color = if c.parents.len() > 1 && !merged_here { theme::DIM } else { theme::TEXT };
             ui.p.text_fit(x, cy, max_x - x, UI, 13.0, &c.subject, subject_color);
             if show_meta {
@@ -3315,16 +3407,21 @@ impl GitApp {
         for &(row, c) in &self.marks {
             ui.p.rect(Rect::new(r.x + 3.0, frac(row + 1) - 0.75, r.w - 6.0, 1.5), c);
         }
-        if let Some(l) = &self.lineage {
-            // The selected branch: a quiet rail from its tip down to where it joins its base…
+        // The selected branch (two in a comparison, the second along the other edge): a quiet
+        // rail from its tip down to where it joins its base…
+        for (k, l) in self.lineages.iter().enumerate() {
             let (y0, y1) = (frac(l.chain[0] as usize + 1), frac(l.chain[l.own - 1] as usize + 1));
-            ui.p.rounded(Rect::new(r.x + 2.0, y0 - 1.5, 2.0, y1 - y0 + 3.0), 1.0, l.color.alpha(0.45));
-            // …and a glowing dot wherever it was merged into another branch (one per pixel row).
+            let x = if k == 0 { r.x + 2.0 } else { r.right() - 4.0 };
+            ui.p.rounded(Rect::new(x, y0 - 1.5, 2.0, y1 - y0 + 3.0), 1.0, l.color.alpha(0.45));
+        }
+        // …and a glowing dot wherever it was merged into another branch (in a comparison: into
+        // the other one), one per pixel row.
+        for l in &self.lineages {
             let mut prev = f32::MIN;
             for &(m, _) in &l.merges {
                 let c = (r.x + r.w * 0.5, frac(m as usize + 1));
                 if c.1 - prev >= 1.0 {
-                    ui.p.glow(c, 3.0, 3.5, l.color.alpha(0.55));
+                    ui.p.glow(c, 3.0, 2.0, l.color.alpha(0.55));
                     ui.p.circle(c, 3.0, l.color);
                     prev = c.1;
                 }
@@ -6921,7 +7018,8 @@ mod tests {
             let hash = git(&["rev-parse", rev]).trim().to_string();
             assert!(h.app.select_hash(&hash));
             h.app.update_lineage();
-            let l = h.app.lineage.as_ref().unwrap();
+            assert_eq!(h.app.lineages.len(), 1);
+            let l = &h.app.lineages[0];
             (l.tip, l.chain.iter().map(|&r| r as usize).collect::<Vec<_>>(), l.own, l.merges.clone())
         };
 
@@ -6942,7 +7040,7 @@ mod tests {
         // The working copy means HEAD's branch.
         h.app.select(Sel::Wip);
         h.app.update_lineage();
-        assert_eq!(h.app.lineage.as_ref().unwrap().tip, row(&h, "main"));
+        assert_eq!(h.app.lineages[0].tip, row(&h, "main"));
 
         // Once the branch is deleted, its commits still form a line of their own.
         let f2 = git(&["rev-parse", "feature"]);
@@ -6953,6 +7051,96 @@ mod tests {
         assert_eq!(tip, h.app.hash_index[f2.trim()]);
         assert_eq!(own, 2);
         assert_eq!(merges.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_comparison_marks_both_branches_and_the_merges_between_them() {
+        // main:    one ← two ← three ← M1 ← four ← M2 ← five
+        // other:         two ← o1 ← Ms ← o2 ← o3
+        // feature:       two ← f1 ← Mf
+        // M1 merged feature (f1) into main, Ms main (three) into other, M2 other (o2) into main,
+        // and Mf main (five) into feature.
+        let dir = temp_repo("cmp-lines");
+        let git = |args: &[&str]| git::run(&dir, args, None).unwrap();
+        let commit = |name: &str| {
+            std::fs::write(dir.join(name), name).unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-qm", name]);
+        };
+        let merge = |rev: &str, msg: &str| drop(git(&["merge", "-q", "--no-ff", rev, "-m", msg]));
+        git(&["branch", "other"]);
+        git(&["checkout", "-qb", "feature"]);
+        commit("f1");
+        git(&["checkout", "-q", "main"]);
+        commit("three");
+        merge("feature", "M1");
+        commit("four");
+        git(&["checkout", "-q", "other"]);
+        commit("o1");
+        merge("main~2", "Ms");
+        commit("o2");
+        git(&["checkout", "-q", "main"]);
+        merge("other", "M2");
+        commit("five");
+        git(&["checkout", "-q", "other"]);
+        commit("o3");
+        git(&["checkout", "-q", "feature"]);
+        merge("main", "Mf");
+        git(&["checkout", "-q", "main"]);
+        let mut h = Harness::new(&dir);
+        let hash = |rev: &str| git(&["rev-parse", rev]).trim().to_string();
+        let row = |h: &Harness, rev: &str| h.app.hash_index[&hash(rev)];
+        let marks = |h: &Harness, revs: [&str; 4]| revs.map(|r| h.app.merge_mark(row(h, r)));
+        let all = ["main~3", "main~1", "other~2", "feature"]; // M1, M2, Ms, Mf
+
+        // main selected: its line, and the merges that took it into other branches (Ms, Mf).
+        assert!(h.app.select_hash(&hash("main")));
+        h.frame();
+        assert_eq!(h.app.lineages.len(), 1);
+        let main = Some(h.app.lineages[0].color);
+        assert_eq!(marks(&h, all), [None, None, main, main]);
+
+        // Compared with an older commit on main: that one line, and with no second branch no
+        // merges between branches either (M1, M2 and Ms are all between the two commits).
+        h.app.compare_with_row(row(&h, "main~4"));
+        h.frame();
+        let lines: Vec<_> = h.app.lineages.iter().map(|l| (l.tip, Some(l.color))).collect();
+        assert_eq!(lines, [(row(&h, "main"), main)]);
+        assert_eq!(marks(&h, all), [None; 4]);
+
+        // Closed: back to the selected branch.
+        h.app.act(Act::CompareClose);
+        h.frame();
+        assert_eq!(marks(&h, all), [None, None, main, main]);
+
+        // other (A) against main (B): both lines, in A's and B's colors. Below where they meet,
+        // the line is main's (it belongs there); other's stops at two. Only the merges between
+        // the two are picked out, in the color of the branch merged in: other into main at M2
+        // (cyan), main into other at Ms (violet). Not feature into main (M1), nor main into
+        // feature (Mf).
+        let (a, b) = (h.app.end_for_row(row(&h, "other")), h.app.end_for_row(row(&h, "main")));
+        h.app.start_compare(a, b, false);
+        h.frame();
+        let lines: Vec<_> = h.app.lineages.iter().map(|l| (l.tip, l.color, l.joins)).collect();
+        assert_eq!(lines, [(row(&h, "main"), theme::PURPLE, false), (row(&h, "other"), theme::CYAN, true)]);
+        assert_eq!(h.app.lineages[1].chain.last(), Some(&(row(&h, "main~5") as u32)));
+        let edges = |h: &Harness, k: usize| h.app.lineages[k].merges.clone();
+        let edge = |h: &Harness, m: &str, p: &str| (row(h, m) as u32, row(h, p) as u32);
+        assert_eq!(edges(&h, 0), [edge(&h, "other~2", "main~4")], "main's three into other at Ms");
+        assert_eq!(edges(&h, 1), [edge(&h, "main~1", "other~1")], "other's o2 into main at M2");
+        assert_eq!(marks(&h, all), [None, Some(theme::CYAN), Some(theme::PURPLE), None]);
+        let c = h.app.compare.as_ref().unwrap();
+        assert_eq!((c.ahead, c.behind), (5, 1), "five, M2, four, M1, f1 against o3");
+
+        // History reloaded underneath (a new commit moves every row down): found where they are.
+        let before = row(&h, "main~1");
+        commit("six");
+        h.app.reload_all(true);
+        h.app.finish_loading();
+        h.frame();
+        assert_ne!(row(&h, "main~2"), before);
+        assert_eq!(marks(&h, ["main~4", "main~2", "other~2", "feature"]), [None, Some(theme::CYAN), Some(theme::PURPLE), None]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6979,7 +7167,7 @@ mod tests {
         assert!(h.app.select_hash(one.trim()));
         h.app.update_lineage();
         let tip = git(&["rev-parse", "production"]);
-        assert_eq!(h.app.lineage.as_ref().unwrap().tip, h.app.hash_index[tip.trim()]);
+        assert_eq!(h.app.lineages[0].tip, h.app.hash_index[tip.trim()]);
         for d in [&dir, &up] {
             let _ = std::fs::remove_dir_all(d);
         }
